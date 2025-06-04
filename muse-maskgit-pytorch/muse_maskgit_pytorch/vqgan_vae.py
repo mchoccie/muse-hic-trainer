@@ -457,6 +457,10 @@ class VQGanVAE(nn.Module):
 
         fmap, indices, commit_loss = self.encode(img)
 
+        if return_loss:
+            unique_codes = indices.unique().numel()
+            print(f"Unique codes used in batch: {unique_codes}")
+
         fmap = self.decode(fmap)
 
         if not return_loss and not return_discr_loss:

@@ -7,3 +7,5 @@ muse-maskgit-pytorch/hic_dataset.npy
 login.txt
 hic_dataset.npy
 *.png
+*.pt
+*.npy

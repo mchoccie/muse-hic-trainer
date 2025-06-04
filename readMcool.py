@@ -35,7 +35,7 @@ def slice_windows(clr, chromosomes, window_bins=256, stride=128):
     return samples
 
 data_folder = "Data/"
-resolution = 25000
+resolution = 50000
 window_bins = 256
 stride = 128
 
@@ -57,6 +57,6 @@ for fname in os.listdir(data_folder):
 if all_samples:
     dataset = np.stack(all_samples)
     print("Final dataset shape:", dataset.shape)
-    np.save("hic_dataset.npy", dataset)
+    np.save("hic_dataset_50kb.npy", dataset)
 else:
     print("No valid samples were collected.")
