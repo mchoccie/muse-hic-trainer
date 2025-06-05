@@ -9,3 +9,4 @@ hic_dataset.npy
 *.png
 *.pt
 *.npy
+logs
