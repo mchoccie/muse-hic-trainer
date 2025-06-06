@@ -151,7 +151,7 @@ class Discriminator(nn.Module):
     def __init__(
         self,
         dims,
-        channels = 3,
+        channels = 1,
         groups = 16,
         init_kernel_size = 5
     ):
@@ -187,7 +187,7 @@ class ResnetEncDec(nn.Module):
         self,
         dim,
         *,
-        channels = 3,
+        channels = 1,
         layers = 4,
         layer_mults = None,
         num_resnet_blocks = 1,
@@ -287,7 +287,7 @@ class VQGanVAE(nn.Module):
         self,
         *,
         dim,
-        channels = 3,
+        channels = 1,
         layers = 4,
         l2_recon_loss = False,
         use_hinge_loss = True,
