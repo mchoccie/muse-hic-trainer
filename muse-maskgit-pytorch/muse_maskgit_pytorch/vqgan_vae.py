@@ -22,28 +22,6 @@ MList = nn.ModuleList
 
 # helper functions
 
-# ─── distance-to-diagonal weighting ────────────────────────────────────────────
-def make_diag_weight(h: int, device: torch.device, alpha: float = 2.0):
-    """
-    Returns a [1,1,h,h] tensor whose (i,j) entry is exp(-|i-j| / alpha)
-    - alpha small  → very steep focus on the diagonal
-    - alpha large  → gentler fall-off
-    """
-    idx = torch.arange(h, device=device)
-    dist = (idx[:, None] - idx[None, :]).abs().float()          # |i-j|
-    w    = torch.exp(-(dist / alpha))                           # e^{-d/α}
-    w    = w / w.mean()                                         # keep loss magnitude stable
-    return w[None, None]                                        # shape [1,1,H,W]
-
-def distance_weighted_loss(recon, target, gamma=1.0):
-    B, C, H, W = target.shape
-    device = target.device
-    dist = torch.abs(torch.arange(H, device=device).view(-1, 1) - torch.arange(W, device=device).view(1, -1)).float()
-    weight = 1.0 / (1.0 + gamma * dist)
-    weight = weight.unsqueeze(0).unsqueeze(0)  # shape [1, 1, H, W]
-    loss = ((recon - target) ** 2) * weight
-    return loss.mean()
-
 def exists(val):
     return val is not None
 
@@ -173,7 +151,7 @@ class Discriminator(nn.Module):
     def __init__(
         self,
         dims,
-        channels = 1,
+        channels = 3,
         groups = 16,
         init_kernel_size = 5
     ):
@@ -209,7 +187,7 @@ class ResnetEncDec(nn.Module):
         self,
         dim,
         *,
-        channels = 1,
+        channels = 3,
         layers = 4,
         layer_mults = None,
         num_resnet_blocks = 1,
@@ -309,7 +287,7 @@ class VQGanVAE(nn.Module):
         self,
         *,
         dim,
-        channels = 1,
+        channels = 3,
         layers = 4,
         l2_recon_loss = False,
         use_hinge_loss = True,
@@ -359,13 +337,12 @@ class VQGanVAE(nn.Module):
             self.quantizer = VQ(
                 dim = self.enc_dec.encoded_dim,
                 codebook_size = codebook_size,
-                accept_image_fmap = True,
+                accept_image_fmap = True
                 **vq_kwargs
             )
 
         # reconstruction loss
-        #self.recon_loss_fn = partial(distance_weighted_loss, gamma=1.5)
-        # This is the old recon loss
+
         self.recon_loss_fn = F.mse_loss if l2_recon_loss else F.l1_loss
 
         # turn off GAN and perceptual loss if grayscale
@@ -480,11 +457,6 @@ class VQGanVAE(nn.Module):
 
         fmap, indices, commit_loss = self.encode(img)
 
-        if return_loss:
-            unique_codes = indices.unique().numel()
-            print(f"Unique codes used in batch: {unique_codes}")
-            flat_indices = indices.view(-1)  # make it 1D
-            print("Top used codes:", torch.bincount(flat_indices).topk(10))
         fmap = self.decode(fmap)
 
         if not return_loss and not return_discr_loss:
@@ -515,18 +487,7 @@ class VQGanVAE(nn.Module):
 
         # reconstruction loss
 
-        ## This code helps to ensure that the diagonal weighting is computed correctly
-        # ── distance-weighted reconstruction loss ─────────────────────────────────────
-        if (not hasattr(self, "_diag_weight")) or self._diag_weight.shape[-1] != height:
-            # cache mask for current spatial size
-            self._diag_weight = make_diag_weight(height, img.device, alpha=2.0)
-
-        if self.recon_loss_fn == F.l1_loss:
-            recon_err = torch.abs(fmap - img)
-        else:   # mse
-            recon_err = (fmap - img) ** 2
-
-        recon_loss = (recon_err * self._diag_weight).mean()
+        recon_loss = self.recon_loss_fn(fmap, img)
 
         # early return if training on grayscale
 
