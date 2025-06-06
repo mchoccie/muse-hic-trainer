@@ -1,12 +1,21 @@
 import cooler
-import matplotlib.pyplot as plt
 import numpy as np
-import h5py
 import os
-from scipy.ndimage import gaussian_filter
 
-def slice_windows(clr, chromosomes, window_bins=256, stride=128):
+# === CONFIG ===
+data_folder = "Data/"
+resolution = 50000
+window_bins = 256
+stride = 128
+reference_genome = "hg19"  # just for annotation purposes
+
+# Store results
+all_samples = []
+window_coordinates = []  # <-- NEW: store genomic coordinates
+
+def slice_windows_with_coords(clr, chromosomes, resolution, window_bins=256, stride=128):
     samples = []
+    coords = []
 
     for chrom in chromosomes:
         print(f"  Processing {chrom}")
@@ -23,23 +32,23 @@ def slice_windows(clr, chromosomes, window_bins=256, stride=128):
         for i in range(0, mat.shape[0] - window_bins + 1, stride):
             w = mat[i:i+window_bins, i:i+window_bins]
 
-            # Optional: Filter out very sparse windows
             if np.count_nonzero(w) / w.size < 0.05:
                 continue
 
             w = (w - np.mean(w)) / (np.std(w) + 1e-6)
             samples.append(w.astype(np.float32)[None, ...])
+
+            # === Calculate genomic coordinates ===
+            start = i * resolution
+            end = (i + window_bins) * resolution
+            coords.append((chrom, start, end))
+
             count += 1
 
         print(f"    Kept {count} windows from {chrom}")
-    return samples
+    return samples, coords
 
-data_folder = "Data/"
-resolution = 25000
-window_bins = 512
-stride = 128
-
-all_samples = []
+# === Process each mcool file ===
 for fname in os.listdir(data_folder):
     if fname.endswith(".mcool"):
         fpath = os.path.join(data_folder, fname)
@@ -49,14 +58,18 @@ for fname in os.listdir(data_folder):
         try:
             clr = cooler.Cooler(cooler_path)
             chroms = [c for c in clr.chromnames if c != "chrY"]
-            samples = slice_windows(clr, chroms, window_bins, stride)
+            samples, coords = slice_windows_with_coords(clr, chroms, resolution, window_bins, stride)
             all_samples.extend(samples)
+            window_coordinates.extend(coords)
         except Exception as e:
             print(f"  Failed to process {fname}: {e}")
-#sliced_dataset =  slice_windows(clr, chroms, resolution=resolution, window_bins=256, stride=128)
+
+# === Save output ===
 if all_samples:
     dataset = np.stack(all_samples)
     print("Final dataset shape:", dataset.shape)
-    np.save("hic_dataset_25kb_highres.npy", dataset)
+
+    np.save("hic_dataset_50kb.npy", dataset)
+    np.save("hic_window_coords.npy", np.array(window_coordinates, dtype=object))
 else:
     print("No valid samples were collected.")

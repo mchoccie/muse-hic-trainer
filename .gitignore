@@ -10,3 +10,5 @@ hic_dataset.npy
 *.pt
 *.npy
 logs
+*fa
+*fai
