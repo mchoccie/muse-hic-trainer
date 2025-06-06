@@ -11,11 +11,11 @@ vae = VQGanVAE(
 trainer = VQGanVAETrainer(
     vae = vae,
     image_size = 128,             # you may want to start with small images, and then curriculum learn to larger ones, but because the vae is all convolution, it should generalize to 512 (as in paper) without training on it
-    folder = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_50kb.npy',
+    folder = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_25kb_highres.npy',
     batch_size = 4,
     grad_accum_every = 8,
     num_train_steps = 50000,
-    results_folder = './baseResults'
+    results_folder = './baseResultsHighresolution',
 ).cuda()
 
 trainer.train()
