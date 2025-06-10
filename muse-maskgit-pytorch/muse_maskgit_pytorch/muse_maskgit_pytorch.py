@@ -17,6 +17,7 @@ from beartype import beartype
 
 from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
 from muse_maskgit_pytorch.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
+from muse_maskgit_pytorch.dna_encoder import EnformerEncoder
 from muse_maskgit_pytorch.attend import Attend
 
 from tqdm.auto import tqdm
