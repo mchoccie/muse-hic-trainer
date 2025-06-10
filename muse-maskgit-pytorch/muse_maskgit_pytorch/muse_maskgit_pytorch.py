@@ -208,6 +208,7 @@ class Transformer(nn.Module):
         t5_name = DEFAULT_T5_NAME,
         self_cond = False,
         add_mask_id = False,
+        dna_encoder: EnformerEncoder = None,
         **kwargs
     ):
         super().__init__()
@@ -230,6 +231,13 @@ class Transformer(nn.Module):
         self.encode_text = partial(t5_encode_text, name = t5_name)
 
         text_embed_dim = get_encoded_dim(t5_name)
+                # optional DNA encoder
+        self.dna_encoder = dna_encoder
+        dna_dim = None
+        if dna_encoder is not None:
+            dna_dim = dna_encoder.encode([('chr1',0,12800000)]).shape[-1]
+
+        text_embed_dim = dna_dim if dna_dim is not None else get_encoded_dim(t5_name)
 
         self.text_embed_proj = nn.Linear(text_embed_dim, dim, bias = False) if text_embed_dim != dim else nn.Identity() 
 
@@ -281,6 +289,7 @@ class Transformer(nn.Module):
         self,
         x,
         return_embed = False,
+        dna_coords: Optional[List[tuple]] = None,
         return_logits = False,
         labels = None,
         ignore_index = 0,
@@ -293,12 +302,17 @@ class Transformer(nn.Module):
         device, b, n = x.device, *x.shape
         assert n <= self.seq_len
 
-        # prepare texts
-
-        assert exists(texts) ^ exists(text_embeds)
-
-        if exists(texts):
-            text_embeds = self.encode_text(texts)
+        if self.dna_encoder is not None:
+            # dna encoder wins unless user overrides with text_embeds
+            assert text_embeds is None and texts is None, \
+                "don't pass both DNA and text"
+            assert dna_coords is not None, "dna_coords required"
+            context = self.dna_encoder.encode(dna_coords).to(x.device)  # [B, 1, E]
+        else:
+            # fall back to text
+            if text_embeds is None:
+                text_embeds = self.encode_text(texts).to(x.device)      # [B, T, E]
+            context = text_embeds
 
         context = self.text_embed_proj(text_embeds)
 
