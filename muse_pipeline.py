@@ -12,6 +12,7 @@ coord_path = "/scratch/rnd-rojas/Manan/hic_window_coords.npy"
 # Hi-C maps       – shape should be [N, 1, 256, 256]
 hic_np = np.load(hic_path, mmap_mode="r")         # mmap saves RAM, remove if you plan to edit
 print("Hi-C numpy  shape :", hic_np.shape, hic_np.dtype)
+num_steps = 1000
 
 # window coordinates – saved as a pickled object array of tuples
 coords_np = np.load(coord_path, allow_pickle=True)
@@ -62,9 +63,22 @@ maskgit = MaskGit(
     cond_image_size = None,  # not doing SR here
 )
 
+optimizer = torch.optim.AdamW(maskgit.parameters(), lr=1e-4)
+
 # /scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_50kb.npy -- these are the Hi-C maps
 # /scratch/rnd-rojas/Manan/hic_window_coords.npy -- these are the coordinates of the Hi-C windows
 loss = maskgit(
     batch_images,                         # [B, 1, 256, 256] Hi-C maps
     dna_coords = batch_coords,      # list[ (chrom,start,end) ] len==B
 )
+
+maskgit.train()
+for step in range(num_steps):  # e.g., num_steps = 10000
+    loss = maskgit(batch_images, dna_coords=batch_coords)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    print(f"[Step {step}] loss = {loss.item():.4f}")
+
