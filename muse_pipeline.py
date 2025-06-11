@@ -35,18 +35,24 @@ enformer_dir = '/scratch/rnd-rojas/Manan/enformer_local'
 genome_fasta = '/scratch/rnd-rojas/Manan/hg19.fa'
 
 dna_enc = EnformerEncoder(enformer_dir, genome_fasta)
-vae = VQGanVAE(
+vaeBase = VQGanVAE(
     dim = 256,
     codebook_size = 1024,
-    lookup_free_quantization=False,
-    l2_recon_loss=True,
-    vq_kwargs=dict(commitment_weight=1.5, decay=0.99),
     use_vgg_and_gan = False
 ).cuda()
 
-vae.load('/scratch/rnd-rojas/Manan/qv_results/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
+vaeHighres = VQGanVAE(
+    dim = 256,
+    codebook_size = 1024,
+    use_vgg_and_gan = False
+).cuda()
 
-transformer = MaskGitTransformer(
+vaeBase.load('/scratch/rnd-rojas/Manan/baseResults/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
+vaeHighres.load('/scratch/rnd-rojas/Manan/baseResultsHighresolution/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
+# ------------------------------------------------------------------
+# 3)  create the MaskGit model
+# ------------------------------------------------------------------
+transformerLowRes = MaskGitTransformer(
     num_tokens = 1024,   # codebook size
     dim        = 512,
     seq_len    = 1024,
@@ -54,19 +60,39 @@ transformer = MaskGitTransformer(
     dna_encoder = dna_enc,   # ← plug in here
 )
 
-transformer = transformer.cuda()  # 👈 Move it AFTER initialization
+transformerHighRes = MaskGitTransformer(
+    num_tokens = 1024,   # codebook size
+    dim        = 512,
+    seq_len    = 1024,
+    depth      = 8,
+    dna_encoder = dna_enc,   # ← plug in here
+)
+
+
+transformerLowRes = transformerLowRes.cuda()  # 👈 Move it AFTER initialization
 
 maskgit = MaskGit(
-    vae           = vae,
-    transformer   = transformer,
+    vae           = vaeBase,
+    transformer   = transformerLowRes,
     image_size    = 256,
     cond_image_size = None,  # not doing SR here
 )
+
+superres_maskgit = MaskGit(
+    vae = vaeHighres,
+    transformer = transformerHighRes,
+    cond_drop_prob = 0.25,
+    image_size = 512,                     # larger image size
+    cond_image_size = 256,                # conditioning image size <- this must be set
+).cuda()
 
 optimizer = torch.optim.AdamW(maskgit.parameters(), lr=1e-4)
 
 # /scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_50kb.npy -- these are the Hi-C maps
 # /scratch/rnd-rojas/Manan/hic_window_coords.npy -- these are the coordinates of the Hi-C windows
+
+
+# Need to train both maskgit models separately
 loss = maskgit(
     batch_images,                         # [B, 1, 256, 256] Hi-C maps
     dna_coords = batch_coords,      # list[ (chrom,start,end) ] len==B
