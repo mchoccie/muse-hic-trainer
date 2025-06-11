@@ -337,7 +337,7 @@ class VQGanVAE(nn.Module):
             self.quantizer = VQ(
                 dim = self.enc_dec.encoded_dim,
                 codebook_size = codebook_size,
-                accept_image_fmap = True
+                accept_image_fmap = True,
                 **vq_kwargs
             )
 

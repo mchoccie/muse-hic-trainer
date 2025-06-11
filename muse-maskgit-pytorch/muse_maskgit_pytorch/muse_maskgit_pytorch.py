@@ -226,11 +226,11 @@ class Transformer(nn.Module):
         self.dim_out = default(dim_out, num_tokens)
         self.to_logits = nn.Linear(dim, self.dim_out, bias = False)
 
-        # text conditioning
+        # text conditioning -- Blocked out T5 model text encoding
 
-        self.encode_text = partial(t5_encode_text, name = t5_name)
+        # self.encode_text = partial(t5_encode_text, name = t5_name)
 
-        text_embed_dim = get_encoded_dim(t5_name)
+        # text_embed_dim = get_encoded_dim(t5_name)
                 # optional DNA encoder
         self.dna_encoder = dna_encoder
         dna_dim = None
@@ -307,16 +307,21 @@ class Transformer(nn.Module):
             assert text_embeds is None and texts is None, \
                 "don't pass both DNA and text"
             assert dna_coords is not None, "dna_coords required"
-            context = self.dna_encoder.encode(dna_coords).to(x.device)  # [B, 1, E]
+            context = torch.as_tensor(self.dna_encoder.encode(dna_coords)).to(x.device)  # [B, 1, E]
         else:
             # fall back to text
             if text_embeds is None:
                 text_embeds = self.encode_text(texts).to(x.device)      # [B, T, E]
             context = text_embeds
 
-        context = self.text_embed_proj(text_embeds)
+        print("context device:", context.device)
+        print("proj weight device:", self.text_embed_proj.weight.device)
 
-        context_mask = (text_embeds != 0).any(dim = -1)
+        context = self.text_embed_proj(context)
+
+        context_mask = (context != 0).any(dim = -1)
+
+        
 
         # classifier free guidance
 
@@ -643,6 +648,7 @@ class MaskGit(nn.Module):
         cond_token_ids: Optional[torch.Tensor] = None,
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None,
+        dna_coords: Optional[List[tuple]] = None,
         cond_drop_prob = None,
         train_only_generator = False,
         sample_temperature = None
@@ -717,7 +723,8 @@ class MaskGit(nn.Module):
                     text_embeds = text_embeds,
                     conditioning_token_ids = cond_token_ids,
                     cond_drop_prob = 0.,
-                    return_embed = True
+                    return_embed = True,
+                    dna_coords = dna_coords
                 )
 
                 self_cond_embed.detach_()
@@ -732,7 +739,8 @@ class MaskGit(nn.Module):
             labels = labels,
             cond_drop_prob = cond_drop_prob,
             ignore_index = ignore_index,
-            return_logits = True
+            return_logits = True,
+            dna_coords = dna_coords
         )
 
         if not exists(self.token_critic) or train_only_generator:

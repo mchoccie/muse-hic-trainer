@@ -46,8 +46,10 @@ class EnformerEncoder:
         batch = torch.stack([self._prep_seq(*c) for c in coords]).to(DEVICE)  # [B, 196k, 4]
 
         # forward – get hidden states at all layers
-        _, hidden = self.model(batch, return_embeddings=True, embedding_layer=EMB_LAYER)
+        _, hidden = self.model(batch, return_embeddings=True)
 
         # hidden is list; we want the chosen layer
-        embeds = hidden[0]                                # [B, 1536, 1536]
+        print("HIDEEN SHAPPEEE: " + str(hidden.shape))
+        embeds = hidden                                # [B, 1536, 1536]
+        print(embeds.shape)
         return embeds
