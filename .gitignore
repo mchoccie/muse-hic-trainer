@@ -13,3 +13,7 @@ logs
 *fa
 *fai
 *.bin
+*.bed
+*.bedGraph
+*.bigWig
+*.bw
