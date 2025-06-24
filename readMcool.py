@@ -1,6 +1,18 @@
 import cooler
 import numpy as np
 import os
+from cooltools.lib.numutils import observed_over_expected, interp_nan, set_diag
+from astropy.convolution import Gaussian2DKernel, convolve
+
+
+import pybedtools
+pass_bed = pybedtools.BedTool("windows_pass.bed")
+
+def window_passes(chrom, start, end):
+    # BedTool wants zero-based half-open intervals
+    return len(pass_bed.intersect(
+        pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True),
+        u=True)) > 0
 
 # === CONFIG ===
 data_folder = "Data/"
@@ -8,44 +20,52 @@ resolution = 50000
 window_bins = 256
 stride = 128
 reference_genome = "hg19"  # just for annotation purposes
+kernel = Gaussian2DKernel(x_stddev=2)      # Akita default σ=2 bins
+DIAG_OFF = 2  
 
 # Store results
 all_samples = []
 window_coordinates = []  # <-- NEW: store genomic coordinates
 
-def slice_windows_with_coords(clr, chromosomes, resolution, window_bins=256, stride=128):
-    samples = []
-    coords = []
+def akita_preprocess(raw_balanced):
+    # 1) clip first diagonals to their median
+    clip = np.nanmedian(np.diag(raw_balanced, DIAG_OFF))
+    for d in range(-DIAG_OFF+1, DIAG_OFF):
+        set_diag(raw_balanced, clip, d)
+    raw_balanced = np.clip(raw_balanced, 0, clip)
+
+    # 2) obs/exp & log
+    exp = observed_over_expected(raw_balanced, ~np.isnan(raw_balanced))[0]
+    oe  = np.log(raw_balanced / exp)
+    oe  = interp_nan(oe)
+    for d in range(-DIAG_OFF+1, DIAG_OFF):
+        set_diag(oe, 0, d)
+
+    # 3) Gaussian smooth
+    sm  = convolve(oe, kernel)
+
+    # 4) **optional** crop ends or unwrap upper-tri
+    return sm.astype(np.float32)
+
+def slice_windows_with_coords(clr, chromosomes, resolution,
+                              window_bins=256, stride=128):
+    samples, coords = [], []
 
     for chrom in chromosomes:
-        print(f"  Processing {chrom}")
-        mat = clr.matrix(balance=True).fetch(chrom)
+        mat_chr = clr.matrix(balance=True).fetch(chrom)
+        for i in range(0, mat_chr.shape[0] - window_bins + 1, stride):
+            start_bp = i * resolution
+            end_bp   = (i + window_bins) * resolution
+            if not window_passes(chrom, start_bp, end_bp):
+                continue                          # <- mappability filter
 
-        if mat.shape[0] < window_bins:
-            print(f"    Skipping {chrom}: only {mat.shape[0]} bins")
-            continue
-
-        mat = np.log1p(mat)
-        mat = np.nan_to_num(mat, nan=0.0)
-
-        count = 0
-        for i in range(0, mat.shape[0] - window_bins + 1, stride):
-            w = mat[i:i+window_bins, i:i+window_bins]
-
-            if np.count_nonzero(w) / w.size < 0.05:
+            w = mat_chr[i:i+window_bins, i:i+window_bins]
+            if np.count_nonzero(w) / w.size < 0.05:    # Akita’s sparsity check
                 continue
 
-            w = (w - np.mean(w)) / (np.std(w) + 1e-6)
-            samples.append(w.astype(np.float32)[None, ...])
-
-            # === Calculate genomic coordinates ===
-            start = i * resolution
-            end = (i + window_bins) * resolution
-            coords.append((chrom, start, end))
-
-            count += 1
-
-        print(f"    Kept {count} windows from {chrom}")
+            w = akita_preprocess(w)              # Akita cleanup
+            samples.append(w[None, ...])         # [1,256,256]  (or vector)
+            coords.append((chrom, start_bp, end_bp))
     return samples, coords
 
 # === Process each mcool file ===
