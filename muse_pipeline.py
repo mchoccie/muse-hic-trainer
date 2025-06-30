@@ -11,30 +11,34 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 def custom_collate(batch):
-    lowres, highres, coords = zip(*batch)
+    lowres, highres, coords_25kb, coords_50kb = zip(*batch)
     return (
         torch.stack(lowres),
         torch.stack(highres),
-        list(coords)  # this preserves coords as a list of tuples
+        list(coords_25kb),  # this preserves coords as a list of tuples
+        list(coords_50kb)  # this preserves coords as a list of tuples
     )
 
 class HiCDataset(Dataset):
-    def __init__(self, lowres_np, highres_np, coords):
+    def __init__(self, lowres_np, highres_np, coords_25kb=None, coords_50kb=None):
         self.lowres_np = lowres_np
         self.highres_np = highres_np
-        self.coords = coords
+        self.coords_25kb = coords_25kb
+        self.coords_50kb = coords_50kb
 
     def __len__(self):
-        return len(self.coords)
+        return len(self.coords_50kb)
 
     def __getitem__(self, idx):
         lowres = torch.from_numpy(self.lowres_np[idx]).float()
         highres = torch.from_numpy(self.highres_np[idx]).float()
-        coord = tuple(self.coords[idx])  # ('chr1', start, end)
-        return lowres, highres, coord
+        coord_25kb = tuple(self.coords_25kb[idx])  # ('chr1', start, end)
+        coord_50kb = tuple(self.coords_50kb[idx]) if self.coords_50kb is not None else None
+        return lowres, highres, coord_25kb, coord_50kb
 hic_path_lowres   = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_50kb.npy"
-hic_path_highres  = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_25kb_highres.npy"
-coord_path = "/scratch/rnd-rojas/Manan/hic_window_coords.npy"
+hic_path_highres  = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_25kb.npy"
+coord_path_50kb = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords.npy"
+coord_path_25kb = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords_25kb.npy"
 
 # Hi-C maps       – shape should be [N, 1, 256, 256]
 hic_np_lowres = np.load(hic_path_lowres, mmap_mode="r")         # mmap saves RAM, remove if you plan to edit
@@ -44,13 +48,15 @@ num_steps = 1000
 
 
 # window coordinates – saved as a pickled object array of tuples
-coords_np = np.load(coord_path, allow_pickle=True)
-coords = [tuple(c) for c in coords_np.tolist()]                 # convert to plain list
-print("coord list len:", len(coords))
-print("first coord   :", coords[0])               # e.g. ('chr1', 0, 12800000)
-
-assert len(coords) == hic_np_lowres.shape[0], "mismatch in #windows"
-dataset = HiCDataset(hic_np_lowres, hic_np_highres, coords)
+coords_np_25kb = np.load(coord_path_25kb, allow_pickle=True)
+coords_np_50kb = np.load(coord_path_50kb, allow_pickle=True)
+coords_50kb = [tuple(c) for c in coords_np_50kb.tolist()]                 # convert to plain list
+coords_25kb = [tuple(c) for c in coords_np_25kb.tolist()]                 # convert to plain list
+print("coord list len:", len(coords_50kb))
+print("first coord   :", coords_50kb[0])               # e.g. ('chr1', 0, 12800000)
+print(hic_np_lowres.shape[0])
+assert len(coords_50kb) == hic_np_lowres.shape[0], "mismatch in #windows"
+dataset = HiCDataset(hic_np_lowres, hic_np_highres, coords_25kb, coords_50kb)
 dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=custom_collate)
 
 # ------------------------------------------------------------------
@@ -133,14 +139,17 @@ optimizer_superres = torch.optim.AdamW(superres_maskgit.parameters(), lr=1e-4)
 # )
 
 superres_maskgit.train()
-for step, (lowres_batch, highres_batch, coord_batch) in enumerate(dataloader):
+maskgit.train()
+for step, (lowres_batch, highres_batch, coord_batch_25kb, coord_batch_50kb) in enumerate(dataloader):
     lowres_batch = lowres_batch.cuda()      # shape: [B, 1, 256, 256]
     highres_batch = highres_batch.cuda()
-    loss = superres_maskgit(highres_batch, dna_coords=coord_batch, cond_images=lowres_batch)
-
+    loss = superres_maskgit(highres_batch, dna_coords=coord_batch_25kb, cond_images=lowres_batch)
+    #loss = maskgit(lowres_batch, dna_coords=coord_batch_50kb)
     optimizer_superres.zero_grad()
     loss.backward()
-    optimizer.step()
+    optimizer_superres.step()
 
     print(f"[Step {step}] loss = {loss.item():.4f}")
+
+torch.save(maskgit.state_dict(), "maskgit_highres.pt")
 
