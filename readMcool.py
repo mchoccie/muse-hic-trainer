@@ -81,44 +81,71 @@
 
 
 
+"""
+Create *paired* low- and high-resolution Hi-C tiles (256×256 @50 kb
+and 512×512 @25 kb) that are perfectly matched base-pair–wise.
+
+Result:
+    ├── lowres_dataset.npy      (N, 1, 256, 256)  -- z-scored, float32
+    ├── highres_dataset.npy     (N, 1, 512, 512)  -- z-scored, float32
+    └── hic_window_coords.npy   (N,) object array  (chrom, start_bp, end_bp)
+"""
+
 import os, cooler, numpy as np, pybedtools
 from scipy.ndimage import gaussian_filter
+from pathlib import Path
 
-# ------------------------------------------------------------------------
-# 0.  User-tuneable parameters
-# ------------------------------------------------------------------------
-data_folder   = "/scratch/rnd-rojas/Manan/Data"            # folder with *.mcool
-lowres_res    = 50_000             # bp / bin
-highres_res   = 25_000
-low_bins      = 256                # 256 × 50 kb  → 12.8 Mb window
-high_bins     = 512                # 512 × 25 kb  → 12.8 Mb window
-low_stride_b  = 128                # stride in *low-res bins*
-high_stride_b = low_stride_b * (lowres_res // highres_res)   # 256 bins
-min_nonzero_frac = 0.05            # drop if >95 % zeros
-gauss_sigma   = 1.0                # set to 0.0 to skip smoothing
+# ----------------------------------------------------------------------
+# configuration
+# ----------------------------------------------------------------------
+data_folder       = "Data/"                 # directory with *.mcool files
 
-# mappability BED (produced with `bedtools map ...`)
-mappability_bed = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/windows_with_mappability.bed"
-pass_bed  = pybedtools.BedTool(mappability_bed)    # big file? cache on SSD
+lowres_res        = 50_000                  # 50-kb resolution
+low_bins          = 256                     # 256×256 tiles
+low_stride_bins   = 128                     # stride in LOW-RES *bins*
 
-def window_passes(chrom, start, end, min_weight=0.5):
-    """Return True if <chrom:start-end> averages ≥ min_weight mappability."""
-    q   = pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True)
-    ovl = pass_bed.intersect(q, wao=True)
+highres_res       = 25_000                  # 25-kb resolution
+high_bins         = 512                     # 512×512 tiles
+# stride_hi will be computed so windows align
 
-    num     = 0.0
-    win_len = end - start
-    for rec in ovl:
-        try:
-            mapp = float(rec[3])
-        except ValueError:          # “.” means no score
-            continue
-        num += mapp * int(rec[-1])  # score × overlap length
+gauss_sigma       = 1.0                     # 0 = disable gaussian blur
+min_nonzero_frac  = 0.05                    # ≥5 % non-zero pixels
 
-    return (num / win_len) >= min_weight
-# ------------------------------------------------------------------------
+# ---------- optional mappability filter -------------------------------
+mappability_bed   = (
+    "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/windows_with_mappability.bed"
+)
+use_mappability   = False                  # ← flip to True to enable
+min_weighted_map  = 0.50                   # keep if ≥50 % mappability
 
+# ----------------------------------------------------------------------
+# helper: mappability gate
+# ----------------------------------------------------------------------
+if use_mappability:
+    pass_bed = pybedtools.BedTool(mappability_bed)
+
+    def window_passes(chrom, start, end, thresh=min_weighted_map):
+        q = pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True)
+        total_len = end - start
+        score = 0.0
+        for iv in pass_bed.intersect(q, wao=True):
+            ov_len = int(iv[-1])
+            try:
+                m = float(iv[3])
+            except ValueError:
+                continue
+            score += m * ov_len
+        return (score / total_len) >= thresh
+else:
+    def window_passes(*_args, **_kw):      # always passes
+        return True
+
+# ----------------------------------------------------------------------
+# extraction
+# ----------------------------------------------------------------------
 low_maps, high_maps, coords = [], [], []
+low_stride_bp = low_stride_bins * lowres_res
+high_stride_bins = low_stride_bp // highres_res  # ensures alignment
 
 for fname in sorted(os.listdir(data_folder)):
     if not fname.endswith(".mcool"):
@@ -129,59 +156,69 @@ for fname in sorted(os.listdir(data_folder)):
     clr_hi = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{highres_res}")
 
     for chrom in clr_lo.chromnames:
-        if chrom == "chrY":    # skip chrY if desired
+        if chrom == "chrY":          # skip chrY if desired
             continue
+
         mat_lo = clr_lo.matrix(balance=True).fetch(chrom)
         mat_hi = clr_hi.matrix(balance=True).fetch(chrom)
 
         kept = 0
-        for i in range(0, mat_lo.shape[0] - low_bins + 1, low_stride_b):
-            # map low-res index → genomic range
+        for i in range(0, mat_lo.shape[0] - low_bins + 1, low_stride_bins):
+            # genomic coordinates of the LOW-RES window
             start_bp = i * lowres_res
-            end_bp   = (i + low_bins) * lowres_res
+            end_bp   = start_bp + low_bins * lowres_res
 
-            # ✅ mappability gate  (uncomment to re-enable)
-            # if not window_passes(chrom, start_bp, end_bp): 
-            #     continue
+            if not window_passes(chrom, start_bp, end_bp):
+                continue
 
-            # slice the aligned windows
-            lo = mat_lo[i:i+low_bins, i:i+low_bins]
-            j  = i * lowres_res // highres_res          # high-res start (bins)
-            hi = mat_hi[j:j+high_bins, j:j+high_bins]
+            lo = mat_lo[i : i + low_bins, i : i + low_bins]
 
-            # skip if either map is too sparse
+            # corresponding index in HIGH-RES bins
+            j = (start_bp // highres_res)
+            hi = mat_hi[j : j + high_bins, j : j + high_bins]
+
+            # sparsity check on *each* map
             if (np.count_nonzero(lo) / lo.size < min_nonzero_frac or
                 np.count_nonzero(hi) / hi.size < min_nonzero_frac):
                 continue
 
-            # basic preprocessing
+            # basic preprocessing ------------------------------------------------
             lo = np.nan_to_num(np.log1p(lo), nan=0.0)
             hi = np.nan_to_num(np.log1p(hi), nan=0.0)
+
             if gauss_sigma > 0:
                 lo = gaussian_filter(lo, sigma=gauss_sigma)
                 hi = gaussian_filter(hi, sigma=gauss_sigma)
 
-            low_maps.append(lo.astype(np.float32)[None, ...])   # [1,256,256]
-            high_maps.append(hi.astype(np.float32)[None, ...])  # [1,512,512]
+            # per-window z-score (good for VQGAN / MaskGit training)
+            lo = (lo - lo.mean()) / (lo.std() + 1e-6)
+            hi = (hi - hi.mean()) / (hi.std() + 1e-6)
+            # --------------------------------------------------------------------
+
+            low_maps.append(lo.astype(np.float32)[None, ...])   # shape (1,256,256)
+            high_maps.append(hi.astype(np.float32)[None, ...])  # shape (1,512,512)
             coords.append((chrom, start_bp, end_bp))
             kept += 1
 
         print(f"  {chrom}: kept {kept} windows")
 
-# ------------------------------------------------------------------------
-# save to .npy
-# ------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# save
+# ----------------------------------------------------------------------
 if not low_maps:
-    raise RuntimeError("No windows passed the filters!")
+    print("\nNo windows satisfied the filters – nothing saved.")
+    raise SystemExit
 
-low_ds   = np.stack(low_maps)      # (N, 1, 256, 256)
-high_ds  = np.stack(high_maps)     # (N, 1, 512, 512)
-coords_a = np.array(coords, dtype=object)
+low_arr  = np.stack(low_maps)    # (N,1,256,256)
+high_arr = np.stack(high_maps)   # (N,1,512,512)
+coords_arr = np.array(coords, dtype=object)
 
-print("\nFinal shapes:")
-print("  low-res :", low_ds.shape)
-print("  high-res:", high_ds.shape)
+print(f"\nLOW  dataset : {low_arr.shape}")
+print(f"HIGH dataset : {high_arr.shape}")
+print(f"coords       : {coords_arr.shape}")
 
-np.save("hic_dataset_50kb.npy",  low_ds)
-np.save("hic_dataset_25kb.npy",  high_ds)
-np.save("hic_window_coords.npy", coords_a)
+np.save("lowres_dataset.npy",  low_arr)
+np.save("highres_dataset.npy", high_arr)
+np.save("hic_window_coords.npy", coords_arr)
+
+print("\nDone ✔")

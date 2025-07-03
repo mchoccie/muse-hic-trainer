@@ -5,7 +5,8 @@
 #SBATCH --output=logs/vqgan_%j.out
 #SBATCH --error=logs/vqgan_%j.err
 #SBATCH --partition=gpuqm            # adjust this to your cluster's GPU partition name
-#SBATCH --time=24:00:00
+#SBATCH --nodelist=g18
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

@@ -10,8 +10,8 @@ vae = VQGanVAE(
 
 trainer = VQGanVAETrainer(
     vae = vae,
-    image_size = 512,             # you may want to start with small images, and then curriculum learn to larger ones, but because the vae is all convolution, it should generalize to 512 (as in paper) without training on it
-    folder = '/scratch/rnd-rojas/Manan/hic_dataset_25kb.npy',
+    image_size = 256,             # you may want to start with small images, and then curriculum learn to larger ones, but because the vae is all convolution, it should generalize to 512 (as in paper) without training on it
+    folder = '/scratch/rnd-rojas/Manan/highres_dataset.npy',
     batch_size = 4,
     grad_accum_every = 8,
     num_train_steps = 50000,
