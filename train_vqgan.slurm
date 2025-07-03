@@ -4,7 +4,7 @@
 #SBATCH --job-name=vqgan_train
 #SBATCH --output=logs/vqgan_%j.out
 #SBATCH --error=logs/vqgan_%j.err
-#SBATCH --partition=mgpuq            # adjust this to your cluster's GPU partition name
+#SBATCH --partition=gpuqm            # adjust this to your cluster's GPU partition name
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

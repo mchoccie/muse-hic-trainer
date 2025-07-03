@@ -81,98 +81,107 @@
 
 
 
-import os
-import cooler
-import numpy as np
-import pybedtools
+import os, cooler, numpy as np, pybedtools
 from scipy.ndimage import gaussian_filter
 
-# === Load mappability BED ===
+# ------------------------------------------------------------------------
+# 0.  User-tuneable parameters
+# ------------------------------------------------------------------------
+data_folder   = "/scratch/rnd-rojas/Manan/Data"            # folder with *.mcool
+lowres_res    = 50_000             # bp / bin
+highres_res   = 25_000
+low_bins      = 256                # 256 × 50 kb  → 12.8 Mb window
+high_bins     = 512                # 512 × 25 kb  → 12.8 Mb window
+low_stride_b  = 128                # stride in *low-res bins*
+high_stride_b = low_stride_b * (lowres_res // highres_res)   # 256 bins
+min_nonzero_frac = 0.05            # drop if >95 % zeros
+gauss_sigma   = 1.0                # set to 0.0 to skip smoothing
+
+# mappability BED (produced with `bedtools map ...`)
 mappability_bed = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/windows_with_mappability.bed"
-pass_bed = pybedtools.BedTool(mappability_bed)
+pass_bed  = pybedtools.BedTool(mappability_bed)    # big file? cache on SSD
 
-def window_passes(chrom, start, end, min_weighted_mappability=0.5):
-    query = pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True)
-    intersected = pass_bed.intersect(query, wao=True)
+def window_passes(chrom, start, end, min_weight=0.5):
+    """Return True if <chrom:start-end> averages ≥ min_weight mappability."""
+    q   = pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True)
+    ovl = pass_bed.intersect(q, wao=True)
 
-    total_weighted_overlap = 0
-    total_window_length = end - start
-
-    for line in intersected:
-        fields = line.fields
-        overlap_len = int(fields[-1])
+    num     = 0.0
+    win_len = end - start
+    for rec in ovl:
         try:
-            mappability = float(fields[3])
-        except ValueError:
-            continue  # skip if mappability is invalid
-
-        total_weighted_overlap += mappability * overlap_len
-
-    weighted_fraction = total_weighted_overlap / total_window_length
-    return weighted_fraction >= min_weighted_mappability
-
-# === Hi-C Slicing Function ===
-def slice_windows_with_coords(clr, chromosomes, resolution, window_bins=256, stride=128):
-    samples, coords = [], []
-
-    for chrom in chromosomes:
-        print(f"  Processing {chrom}")
-        mat = clr.matrix(balance=True).fetch(chrom)
-
-        if mat.shape[0] < window_bins:
-            print(f"    Skipping {chrom}: only {mat.shape[0]} bins")
+            mapp = float(rec[3])
+        except ValueError:          # “.” means no score
             continue
+        num += mapp * int(rec[-1])  # score × overlap length
 
-        count = 0
-        for i in range(0, mat.shape[0] - window_bins + 1, stride):
-            start_bp = i * resolution
-            end_bp   = (i + window_bins) * resolution
+    return (num / win_len) >= min_weight
+# ------------------------------------------------------------------------
 
-            # # ✅ Mappability check
-            # if not window_passes(chrom, start_bp, end_bp):
+low_maps, high_maps, coords = [], [], []
+
+for fname in sorted(os.listdir(data_folder)):
+    if not fname.endswith(".mcool"):
+        continue
+
+    print(f"\n>>> {fname}")
+    clr_lo = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{lowres_res}")
+    clr_hi = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{highres_res}")
+
+    for chrom in clr_lo.chromnames:
+        if chrom == "chrY":    # skip chrY if desired
+            continue
+        mat_lo = clr_lo.matrix(balance=True).fetch(chrom)
+        mat_hi = clr_hi.matrix(balance=True).fetch(chrom)
+
+        kept = 0
+        for i in range(0, mat_lo.shape[0] - low_bins + 1, low_stride_b):
+            # map low-res index → genomic range
+            start_bp = i * lowres_res
+            end_bp   = (i + low_bins) * lowres_res
+
+            # ✅ mappability gate  (uncomment to re-enable)
+            # if not window_passes(chrom, start_bp, end_bp): 
             #     continue
 
-            w = mat[i:i+window_bins, i:i+window_bins]
+            # slice the aligned windows
+            lo = mat_lo[i:i+low_bins, i:i+low_bins]
+            j  = i * lowres_res // highres_res          # high-res start (bins)
+            hi = mat_hi[j:j+high_bins, j:j+high_bins]
 
-            # ✅ Filter for sparse data
-            if np.count_nonzero(w) / w.size < 0.05:
+            # skip if either map is too sparse
+            if (np.count_nonzero(lo) / lo.size < min_nonzero_frac or
+                np.count_nonzero(hi) / hi.size < min_nonzero_frac):
                 continue
 
-            w = gaussian_filter(np.nan_to_num(np.log1p(w), nan=0.0), sigma=1.0)
-            samples.append(w.astype(np.float32)[None, ...])
+            # basic preprocessing
+            lo = np.nan_to_num(np.log1p(lo), nan=0.0)
+            hi = np.nan_to_num(np.log1p(hi), nan=0.0)
+            if gauss_sigma > 0:
+                lo = gaussian_filter(lo, sigma=gauss_sigma)
+                hi = gaussian_filter(hi, sigma=gauss_sigma)
+
+            low_maps.append(lo.astype(np.float32)[None, ...])   # [1,256,256]
+            high_maps.append(hi.astype(np.float32)[None, ...])  # [1,512,512]
             coords.append((chrom, start_bp, end_bp))
-            count += 1
+            kept += 1
 
-        print(f"    Kept {count} windows from {chrom}")
-    return samples, coords
+        print(f"  {chrom}: kept {kept} windows")
 
-# === Main Processing ===
-data_folder = "Data/"
-resolution = 25000
-window_bins = 512
-stride = 128
+# ------------------------------------------------------------------------
+# save to .npy
+# ------------------------------------------------------------------------
+if not low_maps:
+    raise RuntimeError("No windows passed the filters!")
 
-all_samples, window_coordinates = [], []
-for fname in os.listdir(data_folder):
-    if fname.endswith(".mcool"):
-        fpath = os.path.join(data_folder, fname)
-        cooler_path = f"{fpath}::resolutions/{resolution}"
-        print(f"Processing file: {fname}")
+low_ds   = np.stack(low_maps)      # (N, 1, 256, 256)
+high_ds  = np.stack(high_maps)     # (N, 1, 512, 512)
+coords_a = np.array(coords, dtype=object)
 
-        try:
-            clr = cooler.Cooler(cooler_path)
-            chroms = [c for c in clr.chromnames if c != "chrY"]
-            samples, coords = slice_windows_with_coords(clr, chroms, resolution, window_bins, stride)
-            all_samples.extend(samples)
-            window_coordinates.extend(coords)
-        except Exception as e:
-            print(f"  Failed to process {fname}: {e}")
+print("\nFinal shapes:")
+print("  low-res :", low_ds.shape)
+print("  high-res:", high_ds.shape)
 
-# === Save dataset
-if all_samples:
-    dataset = np.stack(all_samples)
-    print("Final dataset shape:", dataset.shape)
-    np.save("hic_dataset_25kb.npy", dataset)
-    np.save("hic_window_coords.npy", np.array(window_coordinates, dtype=object))
-else:
-    print("No valid samples were collected.")
+np.save("hic_dataset_50kb.npy",  low_ds)
+np.save("hic_dataset_25kb.npy",  high_ds)
+np.save("hic_window_coords.npy", coords_a)
