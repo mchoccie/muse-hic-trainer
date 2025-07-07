@@ -639,6 +639,8 @@ class MaskGit(nn.Module):
 
         images = self.vae.decode_from_ids(ids)
         return images
+    
+    
 
     def forward(
         self,
@@ -764,6 +766,91 @@ class MaskGit(nn.Module):
         return ce_loss + self.critic_loss_weight * bce_loss
 
 # final Muse class
+
+@torch.no_grad()
+def generate_from_dna(maskgit: MaskGit,
+                      dna_coords,               # List[tuple]  len == B
+                      cond_images=None,         # low-res maps (B,1,H,W) for SR
+                      temperature=1.,
+                      topk_filter_thres=0.9,
+                      timesteps=18,
+                      cond_scale=3.,
+                      critic_noise_scale=1.,
+                      force_not_use_token_critic=False,
+                      can_remask_prev_masked=False):
+    """
+    Replica of MaskGit.generate, but conditioned on DNA windows
+    instead of text.  Works for both base and super-res models.
+    """
+    device   = next(maskgit.parameters()).device
+    fmap     = maskgit.vae.get_encoded_fmap_size(maskgit.image_size)
+    seq_len  = fmap ** 2
+    B        = len(dna_coords)
+
+    # ------------------------------------------------------------------ 0) book-keeping
+    ids    = torch.full((B, seq_len), maskgit.mask_id, device=device)
+    scores = torch.zeros_like(ids, dtype=torch.float32)
+
+    cond_token_ids = None
+    if maskgit.resize_image_for_cond_image:
+        assert cond_images is not None, '`cond_images` required for SR model'
+        _, cond_token_ids, _ = maskgit.cond_vae.encode(cond_images)
+
+    # choose which forward pass we’ll call (with CFG)
+    demask_fn = maskgit.transformer.forward_with_cond_scale
+    if exists(maskgit.token_critic) and not force_not_use_token_critic:
+        token_critic_fn = maskgit.token_critic.forward_with_cond_scale
+        use_token_critic = True
+    else:
+        use_token_critic = False
+
+    self_cond_embed = None
+    start_T = temperature
+
+    for step, t in enumerate(torch.linspace(0, 1, timesteps, device=device)):
+        # 1) mask some tokens ------------------------------------------------
+        mask_ratio  = maskgit.noise_schedule(t)
+        k           = max(int((mask_ratio * seq_len).item()), 1)
+        masked_idx  = scores.topk(k, dim=-1).indices
+        ids.scatter_(1, masked_idx, maskgit.mask_id)
+
+        # 2) forward pass ----------------------------------------------------
+        logits, embed = demask_fn(ids,
+                                  dna_coords=dna_coords,
+                                  self_cond_embed=self_cond_embed,
+                                  conditioning_token_ids=cond_token_ids,
+                                  cond_scale=cond_scale,
+                                  return_embed=True)
+        if maskgit.self_cond:
+            self_cond_embed = embed.detach()
+
+        # 3) sample ----------------------------------------------------------
+        logits = top_k(logits, topk_filter_thres)
+        temp   = start_T * (timesteps - 1 - step) / (timesteps - 1)
+        pred   = gumbel_sample(logits, temperature=temp, dim=-1)
+
+        is_mask = ids == maskgit.mask_id
+        ids     = torch.where(is_mask, pred, ids)
+
+        # 4) update confidence scores ---------------------------------------
+        if use_token_critic:
+            sc = token_critic_fn(ids,
+                                 dna_coords=dna_coords,
+                                 conditioning_token_ids=cond_token_ids,
+                                 cond_scale=cond_scale).squeeze(-1)
+            sc += (uniform(sc.shape, device=device) - 0.5) * critic_noise_scale
+            scores = sc
+        else:
+            probs  = logits.softmax(-1)
+            scores = 1 - probs.gather(2, pred[..., None]).squeeze(-1)
+            if not can_remask_prev_masked:
+                scores.masked_fill_(~is_mask, -1e5)
+
+    # ------------------------------------------------------------------ decode
+    ids = rearrange(ids, 'b (h w) -> b h w', h=fmap)
+    return maskgit.vae.decode_from_ids(ids)
+# ----------------------------------------------------------------------
+
 
 @beartype
 class Muse(nn.Module):

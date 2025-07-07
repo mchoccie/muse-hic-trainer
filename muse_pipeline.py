@@ -11,34 +11,31 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 def custom_collate(batch):
-    lowres, highres, coords_25kb, coords_50kb = zip(*batch)
+    lowres, highres, coords = zip(*batch)
     return (
         torch.stack(lowres),
         torch.stack(highres),
-        list(coords_25kb),  # this preserves coords as a list of tuples
-        list(coords_50kb)  # this preserves coords as a list of tuples
+        list(coords),  # this preserves coords as a list of tuples
+            # this preserves coords as a list of tuples
     )
 
 class HiCDataset(Dataset):
-    def __init__(self, lowres_np, highres_np, coords_25kb=None, coords_50kb=None):
+    def __init__(self, lowres_np, highres_np, coords):
         self.lowres_np = lowres_np
         self.highres_np = highres_np
-        self.coords_25kb = coords_25kb
-        self.coords_50kb = coords_50kb
+        self.coords = coords
 
     def __len__(self):
-        return len(self.coords_50kb)
+        return len(self.coords)
 
     def __getitem__(self, idx):
         lowres = torch.from_numpy(self.lowres_np[idx]).float()
         highres = torch.from_numpy(self.highres_np[idx]).float()
-        coord_25kb = tuple(self.coords_25kb[idx])  # ('chr1', start, end)
-        coord_50kb = tuple(self.coords_50kb[idx]) if self.coords_50kb is not None else None
-        return lowres, highres, coord_25kb, coord_50kb
-hic_path_lowres   = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_50kb.npy"
-hic_path_highres  = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_dataset_25kb.npy"
-coord_path_50kb = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords.npy"
-coord_path_25kb = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords_25kb.npy"
+        coords = tuple(self.coords[idx])  # ('chr1', start, end)
+        return lowres, highres, coords
+hic_path_lowres   = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/lowres_dataset.npy"
+hic_path_highres  = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/highres_dataset.npy"
+coords_path = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords.npy"
 
 # Hi-C maps       – shape should be [N, 1, 256, 256]
 hic_np_lowres = np.load(hic_path_lowres, mmap_mode="r")         # mmap saves RAM, remove if you plan to edit
@@ -48,15 +45,13 @@ num_steps = 1000
 
 
 # window coordinates – saved as a pickled object array of tuples
-coords_np_25kb = np.load(coord_path_25kb, allow_pickle=True)
-coords_np_50kb = np.load(coord_path_50kb, allow_pickle=True)
-coords_50kb = [tuple(c) for c in coords_np_50kb.tolist()]                 # convert to plain list
-coords_25kb = [tuple(c) for c in coords_np_25kb.tolist()]                 # convert to plain list
-print("coord list len:", len(coords_50kb))
-print("first coord   :", coords_50kb[0])               # e.g. ('chr1', 0, 12800000)
+coords = np.load(coords_path, allow_pickle=True)
+coords = [tuple(c) for c in coords.tolist()]                 # convert to plain list
+print("coord list len:", len(coords))
+print("first coord   :", coords[0])               # e.g. ('chr1', 0, 12800000)
 print(hic_np_lowres.shape[0])
-assert len(coords_50kb) == hic_np_lowres.shape[0], "mismatch in #windows"
-dataset = HiCDataset(hic_np_lowres, hic_np_highres, coords_25kb, coords_50kb)
+assert len(coords) == hic_np_lowres.shape[0], "mismatch in #windows"
+dataset = HiCDataset(hic_np_lowres, hic_np_highres, coords)
 dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=custom_collate)
 
 # ------------------------------------------------------------------
@@ -85,7 +80,7 @@ vaeHighres = VQGanVAE(
     use_vgg_and_gan = False
 ).cuda()
 
-vaeBase.load('/scratch/rnd-rojas/Manan/baseResults/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
+vaeBase.load('/scratch/rnd-rojas/Manan/vqgan_25kb_ckpts/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
 vaeHighres.load('/scratch/rnd-rojas/Manan/baseResultsHighresolution/vae.49000.pt') # you will want to load the exponentially moving averaged VAE
 # ------------------------------------------------------------------
 # 3)  create the MaskGit model
@@ -140,14 +135,16 @@ optimizer_superres = torch.optim.AdamW(superres_maskgit.parameters(), lr=1e-4)
 
 superres_maskgit.train()
 maskgit.train()
-for step, (lowres_batch, highres_batch, coord_batch_25kb, coord_batch_50kb) in enumerate(dataloader):
+for step, (lowres_batch, highres_batch, coords) in enumerate(dataloader):
     lowres_batch = lowres_batch.cuda()      # shape: [B, 1, 256, 256]
     highres_batch = highres_batch.cuda()
-    loss = superres_maskgit(highres_batch, dna_coords=coord_batch_25kb, cond_images=lowres_batch)
-    #loss = maskgit(lowres_batch, dna_coords=coord_batch_50kb)
+    loss = superres_maskgit(highres_batch, dna_coords=coords, cond_images=lowres_batch)
+    #loss = maskgit(lowres_batch, dna_coords=coords)
     optimizer_superres.zero_grad()
+    #optimizer.zero_grad()
     loss.backward()
     optimizer_superres.step()
+    #optimizer.step()
 
     print(f"[Step {step}] loss = {loss.item():.4f}")
 
