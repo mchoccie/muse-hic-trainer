@@ -9,7 +9,7 @@ import pathlib
 from pathlib import Path
 import torchvision.transforms as T
 
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Tuple
 
 from einops import rearrange, repeat
 
@@ -17,10 +17,17 @@ from beartype import beartype
 
 from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
 from muse_maskgit_pytorch.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
-from muse_maskgit_pytorch.dna_encoder import EnformerEncoder
+from muse_maskgit_pytorch.dna_encoder import EnformerEncoder, OneHotDNAEncoder
 from muse_maskgit_pytorch.attend import Attend
 
 from tqdm.auto import tqdm
+
+# Updated muse_maskgit_pytorch.py - Add this import at the top with the other imports
+from muse_maskgit_pytorch.dna_encoder import EnformerEncoder, OneHotDNAEncoder
+from muse_maskgit_pytorch.improved_dna_encoders import (
+    KmerDNAEncoder, MotifDNAEncoder, EfficientDNAEncoder, 
+    create_dna_encoder
+)
 
 # helpers
 
@@ -208,7 +215,7 @@ class Transformer(nn.Module):
         t5_name = DEFAULT_T5_NAME,
         self_cond = False,
         add_mask_id = False,
-        dna_encoder: EnformerEncoder = None,
+        dna_encoder = None,
         **kwargs
     ):
         super().__init__()
@@ -226,23 +233,20 @@ class Transformer(nn.Module):
         self.dim_out = default(dim_out, num_tokens)
         self.to_logits = nn.Linear(dim, self.dim_out, bias = False)
 
-        # text conditioning -- Blocked out T5 model text encoding
-
-        # self.encode_text = partial(t5_encode_text, name = t5_name)
-
-        # text_embed_dim = get_encoded_dim(t5_name)
-                # optional DNA encoder
+        # optional DNA encoder
         self.dna_encoder = dna_encoder
         dna_dim = None
         if dna_encoder is not None:
-            dna_dim = dna_encoder.encode([('chr1',0,12800000)]).shape[-1]
+            # Test encode to get the dimension
+            test_coords = [('chr1', 0, 12800000)]
+            test_embedding = dna_encoder.encode(test_coords)
+            dna_dim = test_embedding.shape[-1]
 
         text_embed_dim = dna_dim if dna_dim is not None else get_encoded_dim(t5_name)
 
         self.text_embed_proj = nn.Linear(text_embed_dim, dim, bias = False) if text_embed_dim != dim else nn.Identity() 
 
         # optional self conditioning
-
         self.self_cond = self_cond
         self.self_cond_to_init_embed = FeedForward(dim)
 
@@ -307,15 +311,18 @@ class Transformer(nn.Module):
             assert text_embeds is None and texts is None, \
                 "don't pass both DNA and text"
             assert dna_coords is not None, "dna_coords required"
-            context = torch.as_tensor(self.dna_encoder.encode(dna_coords)).to(x.device)  # [B, 1, E]
+            # Ensure DNA encoder is on the same device as input
+            if next(self.dna_encoder.parameters()).device != x.device:
+                self.dna_encoder = self.dna_encoder.to(x.device)
+            context = self.dna_encoder.encode(dna_coords)  # [B, 1, E]
         else:
             # fall back to text
             if text_embeds is None:
                 text_embeds = self.encode_text(texts).to(x.device)      # [B, T, E]
             context = text_embeds
 
-        print("context device:", context.device)
-        print("proj weight device:", self.text_embed_proj.weight.device)
+        # Ensure context is on the same device as input
+        context = context.to(x.device)
 
         context = self.text_embed_proj(context)
 
@@ -513,6 +520,7 @@ class MaskGit(nn.Module):
     def generate(
         self,
         texts: List[str],
+        dna_coords: Optional[List[Tuple[str, int, int]]] = None,
         negative_texts: Optional[List[str]] = None,
         cond_images: Optional[torch.Tensor] = None,
         fmap_size = None,
@@ -542,8 +550,11 @@ class MaskGit(nn.Module):
         starting_temperature = temperature
 
         cond_ids = None
+        
+        #text_embeds = self.transformer.encode_text(texts)
 
-        text_embeds = self.transformer.encode_text(texts)
+        # Use DNA encoder directly instead of non-existent encode_dna method
+        text_embeds = self.transformer.dna_encoder.encode(dna_coords)
 
         demask_fn = self.transformer.forward_with_cond_scale
 

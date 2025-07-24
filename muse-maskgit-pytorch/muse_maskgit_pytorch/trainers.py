@@ -15,7 +15,8 @@ import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
 
-from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
+#from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
+from muse_maskgit_pytorch.vqgan_vae_hic_weighted import VQGanVAE
 
 from einops import rearrange
 
@@ -25,6 +26,8 @@ from ema_pytorch import EMA
 
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import wandb
 
 # helper functions
 
@@ -142,7 +145,12 @@ class VQGanVAETrainer(nn.Module):
         ema_update_after_step = 0,
         ema_update_every = 1,
         apply_grad_penalty_every = 4,
-        accelerate_kwargs: dict = dict()
+        accelerate_kwargs: dict = dict(),
+        use_hic_weighted_loss = False,  # New argument
+        hic_weight_alpha = 1.0,         # New argument
+        wandb_project = None,           # New argument
+        wandb_run_name = None,          # New argument
+        codebook_log_interval = 200     # New argument
     ):
         super().__init__()
 
@@ -257,6 +265,25 @@ class VQGanVAETrainer(nn.Module):
 
         self.results_folder.mkdir(parents = True, exist_ok = True)
 
+        self.use_hic_weighted_loss = use_hic_weighted_loss
+        self.hic_weight_alpha = hic_weight_alpha
+        self.codebook_log_interval = codebook_log_interval
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name
+        self._wandb_initialized = False
+        self._wandb = None
+
+    def _init_wandb(self):
+        if not self._wandb_initialized and self.wandb_project is not None:
+            try:
+                wandb.init(project=self.wandb_project, name=self.wandb_run_name)
+                self._wandb = wandb
+                self._wandb_initialized = True
+            except Exception as e:
+                print(f"[Warning] wandb could not be initialized: {e}")
+                self._wandb = None
+                self._wandb_initialized = True
+
     def save(self, path):
         if not self.accelerator.is_local_main_process:
             return
@@ -313,6 +340,8 @@ class VQGanVAETrainer(nn.Module):
 
         logs = {}
 
+        self._init_wandb()
+
         # update vae (generator)
 
         for _ in range(self.grad_accum_every):
@@ -323,7 +352,9 @@ class VQGanVAETrainer(nn.Module):
                 loss = self.vae(
                     img,
                     add_gradient_penalty = apply_grad_penalty,
-                    return_loss = True
+                    return_loss = True,
+                    use_hic_weighted_loss = self.use_hic_weighted_loss,
+                    hic_weight_alpha = self.hic_weight_alpha
                 )
 
             self.accelerator.backward(loss / self.grad_accum_every)
@@ -409,14 +440,38 @@ class VQGanVAETrainer(nn.Module):
 
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
+        # --- wandb logging ---
+        if self._wandb is not None:
+            self._wandb.log({"train/loss": logs.get('loss', 0.0), "step": steps})
+        # --- codebook usage logging ---
+        if self._wandb is not None and (steps % self.codebook_log_interval == 0):
+            try:
+                self.vae.eval()
+                with torch.no_grad():
+                    img = next(self.dl_iter).to(device)
+                    _, indices, _ = self.vae.encode(img)
+                    flat_indices = indices.cpu().numpy().flatten()
+                    hist, bins = np.histogram(flat_indices, bins=self.vae.codebook_size, range=(0, self.vae.codebook_size))
+                    usage = (hist > 0).sum()
+                    entropy = -np.sum((hist / hist.sum() + 1e-8) * np.log(hist / hist.sum() + 1e-8))
+                    self._wandb.log({
+                        "codebook/unique_codes": int(usage),
+                        "codebook/entropy": float(entropy),
+                        "codebook/histogram": self._wandb.Histogram(flat_indices),
+                        "step": steps
+                    })
+                    print(f"[Codebook] Unique codes: {usage}, Entropy: {entropy:.2f}")
+            except Exception as e:
+                print(f"[Warning] wandb codebook logging failed: {e}")
         self.steps += 1
         return logs
 
     def train(self, log_fn = noop):
         device = next(self.vae.parameters()).device
-
+        self._init_wandb()
         while self.steps < self.num_train_steps:
             logs = self.train_step()
             log_fn(logs)
-
+        if self._wandb is not None:
+            self._wandb.finish()
         self.print('training complete')
