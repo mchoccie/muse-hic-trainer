@@ -1,6 +1,6 @@
 import torch
 from muse_maskgit_pytorch import VQGanVAE, MaskGit, MaskGitTransformer
-from muse_maskgit_pytorch.dna_encoder import EnformerEncoder
+from muse_maskgit_pytorch.dna_encoder import EnformerEncoder, OneHotDNAEncoder
 import numpy as np
 
 # ------------------------------------------------------------------
@@ -67,7 +67,7 @@ dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, coll
 enformer_dir = '/scratch/rnd-rojas/Manan/enformer_local'
 genome_fasta = '/scratch/rnd-rojas/Manan/hg19.fa'
 
-dna_enc = EnformerEncoder(enformer_dir, genome_fasta)
+dna_enc = OneHotDNAEncoder(genome_fasta)
 vaeBase = VQGanVAE(
     dim = 256,
     codebook_size = 1024,
@@ -138,15 +138,15 @@ maskgit.train()
 for step, (lowres_batch, highres_batch, coords) in enumerate(dataloader):
     lowres_batch = lowres_batch.cuda()      # shape: [B, 1, 256, 256]
     highres_batch = highres_batch.cuda()
-    loss = superres_maskgit(highres_batch, dna_coords=coords, cond_images=lowres_batch)
-    #loss = maskgit(lowres_batch, dna_coords=coords)
-    optimizer_superres.zero_grad()
-    #optimizer.zero_grad()
+    #loss = superres_maskgit(highres_batch, dna_coords=coords, cond_images=lowres_batch)
+    loss = maskgit(lowres_batch, dna_coords=coords)
+    #optimizer_superres.zero_grad()
+    optimizer.zero_grad()
     loss.backward()
-    optimizer_superres.step()
-    #optimizer.step()
+    #optimizer_superres.step()
+    optimizer.step()
 
     print(f"[Step {step}] loss = {loss.item():.4f}")
 
-torch.save(maskgit.state_dict(), "maskgit_highres.pt")
+torch.save(maskgit.state_dict(), "maskgit_lowres.pt")
 

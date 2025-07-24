@@ -18,4 +18,4 @@ conda activate muse  # or your env name
 
 cd /scratch/rnd-rojas/Manan
 # Run your script
-python trainvqganbase.py
+python trainVQGan.py

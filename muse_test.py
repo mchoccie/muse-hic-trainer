@@ -1,102 +1,115 @@
-import torch
-import numpy as np
+#!/usr/bin/env python
+import torch, numpy as np, matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
+
 from muse_maskgit_pytorch import VQGanVAE, MaskGit, MaskGitTransformer
 from muse_maskgit_pytorch.dna_encoder import EnformerEncoder
+from muse_maskgit_pytorch.muse_maskgit_pytorch import generate_from_dna
 
-# ---------------------------------------------------------------
-# Load Hi-C Data (assuming .npy files)
-# ---------------------------------------------------------------
-lowres_np_path  = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/lowres_dataset.npy"
-highres_np_path = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/highres_dataset.npy"  # optional
-coords_path     = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/hic_window_coords.npy"
+# ------------------------------------------------------------------  paths
+root = "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch"
+lowres_np_path  = f"{root}/lowres_dataset.npy"       # [N, 1, 256, 256]
+highres_np_path = f"{root}/highres_dataset.npy"      # [N, 1, 512, 512]
+coords_path     = f"{root}/hic_window_coords.npy"
 
-lowres_np = np.load(lowres_np_path, mmap_mode="r")
-coords = np.load(coords_path, allow_pickle=True)
-coords = [tuple(c) for c in coords.tolist()]
-assert len(coords) == lowres_np.shape[0], "Mismatch in coord count and images"
+# ------------------------------------------------------------------  load arrays
+lowres_np   = np.load(lowres_np_path,   mmap_mode="r")
+highres_np  = np.load(highres_np_path,  mmap_mode="r")
+coords      = [tuple(c) for c in np.load(coords_path, allow_pickle=True).tolist()]
 
-# ---------------------------------------------------------------
-# Define Dataset
-# ---------------------------------------------------------------
+assert len(coords) == len(lowres_np) == len(highres_np)
+
+# ------------------------------------------------------------------  dataset / loader
 class HiCDataset(Dataset):
-    def __init__(self, lowres_np, coords):
-        self.lowres_np = lowres_np
-        self.coords = coords
-
-    def __len__(self):
-        return len(self.coords)
-
+    def __init__(self, low, high, coords):
+        self.low, self.high, self.coords = low, high, coords
+    def __len__(self): return len(self.coords)
     def __getitem__(self, idx):
-        lowres = torch.from_numpy(self.lowres_np[idx]).float()  # shape: [1, 256, 256]
-        coord = self.coords[idx]  # tuple
-        return lowres, coord
+        return ( torch.from_numpy(self.low [idx]).float(),   # [1,256,256]
+                 torch.from_numpy(self.high[idx]).float(),   # [1,512,512]
+                 self.coords[idx] )
 
 def collate_fn(batch):
-    lows, coords = zip(*batch)
-    return torch.stack(lows), list(coords)
+    lows, highs, coords = zip(*batch)
+    return torch.stack(lows), torch.stack(highs), list(coords)
 
-dataset = HiCDataset(lowres_np, coords)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+loader = DataLoader(HiCDataset(lowres_np, highres_np, coords),
+                    batch_size=8, shuffle=False, collate_fn=collate_fn)
 
-# ---------------------------------------------------------------
-# Load Enformer DNA Encoder
-# ---------------------------------------------------------------
-enformer_dir = '/scratch/rnd-rojas/Manan/enformer_local'
-genome_fasta = '/scratch/rnd-rojas/Manan/hg19.fa'
-dna_encoder = EnformerEncoder(enformer_dir, genome_fasta)
+lowres_batch, highres_batch, coords_batch = next(iter(loader))
+lowres_batch  = lowres_batch.cuda()            # [B,1,256,256]
+highres_batch = highres_batch.cuda()
 
-# ---------------------------------------------------------------
-# Load Pretrained VQGAN and MaskGit
-# ---------------------------------------------------------------
-vaeHighres = VQGanVAE(
-    dim=256,
-    codebook_size=1024,
-    use_vgg_and_gan=False
-).cuda()
+# ------------------------------------------------------------------  DNA encoder + model
+dna_encoder = EnformerEncoder('/scratch/rnd-rojas/Manan/enformer_local',
+                              '/scratch/rnd-rojas/Manan/hg19.fa')
 
-vaeHighres.load('/scratch/rnd-rojas/Manan/baseResultsHighresolution/vae.49000.pt')
+vae = VQGanVAE(dim=256, codebook_size=1024, use_vgg_and_gan=False).cuda()
+vae.load('/scratch/rnd-rojas/Manan/baseResultsHighresolution/vae.49000.pt')
 
-transformerLowRes = MaskGitTransformer(
-    num_tokens = 1024,   # codebook size
-    dim        = 512,
-    seq_len    = 1024,
-    depth      = 8,
-    dna_encoder = dna_encoder,   # ← plug in here
-)
-
-transformerHighRes = MaskGitTransformer(
-    num_tokens = 1024,   # codebook size
-    dim        = 512,
-    seq_len    = 1024,
-    depth      = 8,
-    dna_encoder = dna_encoder,   # ← plug in here
-)
-
+transformer = MaskGitTransformer(num_tokens=1024, dim=512, seq_len=1024,
+                                 depth=8, dna_encoder=dna_encoder).cuda()
 
 superres_maskgit = MaskGit(
-    vae=vaeHighres,
-    transformer=transformerHighRes,
-    cond_image_size=256,
-    image_size=512,
-    cond_drop_prob=0.0
+        vae             = vae,
+        transformer     = transformer,
+        image_size      = 512,
+        cond_image_size = 256,     # <-- very important for SR
+        cond_drop_prob  = 0.
 ).cuda()
 
-# ---------------------------------------------------------------
-# Inference: Generate high-res Hi-C maps from low-res + coords
-# ---------------------------------------------------------------
-checkpoint_path = "/scratch/rnd-rojas/Manan/maskgit_highres.pt"
-state_dict = torch.load(checkpoint_path)
-superres_maskgit.load_state_dict(state_dict)
-lowres_batch, coords_batch = next(iter(dataloader))
-lowres_batch = lowres_batch.cuda()
-
-generated = superres_maskgit.generate(
-    dna_coords=coords_batch,     # ✅ pass to your Enformer encoder
-    cond_images=lowres_batch,
-    cond_scale=3.0
+superres_maskgit.load_state_dict(
+    torch.load("/scratch/rnd-rojas/Manan/maskgit_highres.pt")
 )
 
+# ------------------------------------------------------------------  generate
+generated = generate_from_dna(superres_maskgit,
+                              dna_coords=coords_batch,
+                              cond_images=lowres_batch,
+                              cond_scale=3.0)          # [B,1,512,512]
 
+print("generated:", generated.shape)
 
-print("Generated shape:", generated.shape)  # [B, 1, 512, 512]
+# ---------------------------------------------------------------  print arrays
+np.set_printoptions(edgeitems=4, linewidth=140, suppress=True)   # tidy console
+
+for i in range(min(8, generated.size(0))):
+    arr = generated[i, 0].cpu().numpy()        # (512, 512)  float32
+    print(f"\n=== Predicted map #{i}  {coords_batch[i]}  ===")
+    print(arr)                                 # huge!  remove if undesired
+
+    # optional quick summary per map
+    print("  →  min {:.3f} | max {:.3f} | mean {:.3f} | std {:.3f}"
+          .format(arr.min(), arr.max(), arr.mean(), arr.std()))
+
+# ------------------------------------------------------------------  quick stats
+for tag, arr in [("low256", lowres_batch[:,0]),
+                 ("true512", highres_batch[:,0]),
+                 ("gen512", generated[:,0])]:
+    flat = arr.cpu().view(-1)
+    print(f"{tag:8s}  min={flat.min():6.2f}  max={flat.max():6.2f}  mean={flat.mean():6.2f}")
+
+# ------------------------------------------------------------------  plot
+B = generated.size(0)
+gen_np   = generated[:,0].cpu().numpy()
+truth_np = highres_batch[:,0].cpu().numpy()
+
+fig, axes = plt.subplots(2, B, figsize=(2.5*B, 5))
+for i in range(B):
+    # generated
+    ax = axes[0, i]
+    im = ax.imshow(np.log(gen_np[i]), cmap='magma')
+    ax.set_title(f"GEN\n{coords_batch[i][0]}:{coords_batch[i][1]}")
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
+
+    # ground-truth
+    ax = axes[1, i]
+    im = ax.imshow(truth_np[i], cmap='magma', interpolation='nearest')
+    ax.set_title("GT")
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
+
+plt.tight_layout()
+plt.savefig("gen_vs_gt_batch0.png", dpi=150)
+plt.show()
