@@ -11,7 +11,8 @@ import time
 from tqdm import tqdm
 import wandb  # for experiment tracking
 
-from muse_maskgit_pytorch import VQGanVAE, MaskGit, MaskGitTransformer
+from muse_maskgit_pytorch import MaskGit, MaskGitTransformer
+from muse_maskgit_pytorch.vqgan_vae_hic_weighted import VQGanVAE
 # Updated imports to use improved DNA encoders
 from muse_maskgit_pytorch.improved_dna_encoders import create_dna_encoder
 
@@ -30,8 +31,8 @@ class HiCDataset(Dataset):
         return len(self.coords)
 
     def __getitem__(self, idx):
-        lowres = torch.from_numpy(self.lowres_np[idx]).float()
-        highres = torch.from_numpy(self.highres_np[idx]).float()
+        lowres = torch.from_numpy(self.lowres_np[idx].copy()).float()
+        highres = torch.from_numpy(self.highres_np[idx].copy()).float()
         coords = tuple(self.coords[idx])
         
         # Data augmentation for better generalization
@@ -101,8 +102,8 @@ class TrainingConfig:
         # Model paths
         self.enformer_dir = '/scratch/rnd-rojas/Manan/enformer_local'
         self.genome_fasta = '/scratch/rnd-rojas/Manan/hg19.fa'
-        self.vae_base_path = '/scratch/rnd-rojas/Manan/vqgan_25kb_ckpts/vae.49000.pt'
-        self.vae_highres_path = '/scratch/rnd-rojas/Manan/baseResultsHighresolution/vae.49000.pt'
+        self.vae_base_path = '/scratch/rnd-rojas/Manan/qv_results4/vae.best_srcc.pt'
+        self.vae_highres_path = '/scratch/rnd-rojas/Manan/qv_results_highres_new/vae.best_srcc.pt'
         
         # DNA Encoder configuration - UPDATED to use simple encoder
         self.dna_encoder_type = 'simple'  # 'simple', 'efficient', 'kmer', 'motif'
@@ -166,6 +167,7 @@ def ensure_coord_tuples(coords):
 class MuseTrainer:
     def __init__(self, config):
         self.config = config
+        print(self.config)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Initialize logging
@@ -279,12 +281,14 @@ class MuseTrainer:
         self.vae_base = VQGanVAE(
             dim=256,
             codebook_size=1024,
+            lookup_free_quantization = True,   # ← match checkpoint
             use_vgg_and_gan=False
         ).to(self.device)
         
         self.vae_highres = VQGanVAE(
-            dim=256,
-            codebook_size=1024,
+            dim=512,
+            codebook_size=4096,
+            lookup_free_quantization = True,   # ← same here
             use_vgg_and_gan=False
         ).to(self.device)
         
@@ -305,7 +309,7 @@ class MuseTrainer:
         ).to(self.device)
         
         self.transformer_highres = MaskGitTransformer(
-            num_tokens=1024,
+            num_tokens=4096,  # Match the high-res VAE codebook size
             dim=self.config.transformer_dim,
             seq_len=1024,
             depth=self.config.transformer_depth,

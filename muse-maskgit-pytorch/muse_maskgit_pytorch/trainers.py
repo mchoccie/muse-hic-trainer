@@ -28,6 +28,7 @@ from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import wandb
+from scipy.stats import spearmanr
 
 # helper functions
 
@@ -272,6 +273,36 @@ class VQGanVAETrainer(nn.Module):
         self.wandb_run_name = wandb_run_name
         self._wandb_initialized = False
         self._wandb = None
+        self.best_srcc = -float('inf')
+
+    @staticmethod
+    def compute_srcc(x, y):
+        # x, y: [B, C, H, W] torch tensors
+        # Compute mean SRCC over batch
+        x = x.detach().cpu().numpy()
+        y = y.detach().cpu().numpy()
+        srccs = []
+        for i, (xb, yb) in enumerate(zip(x, y)):
+            xb = xb.flatten()
+            yb = yb.flatten()
+            
+            # Check for constant arrays
+            if np.std(xb) == 0 or np.std(yb) == 0:
+                print(f"[Warning] Constant array detected in batch {i}: x_std={np.std(xb):.6f}, y_std={np.std(yb):.6f}")
+                print(f"[Warning] x_range=[{xb.min():.6f}, {xb.max():.6f}], y_range=[{yb.min():.6f}, {yb.max():.6f}]")
+                srccs.append(0.0)  # Assign 0 correlation for constant arrays
+                continue
+                
+            try:
+                srcc = spearmanr(xb, yb).correlation
+                srccs.append(srcc if srcc is not None else 0.0)
+            except Exception as e:
+                print(f"[Warning] SRCC computation failed for batch {i}: {e}")
+                srccs.append(0.0)
+        
+        mean_srcc = float(np.mean(srccs))
+        print(f"[SRCC Debug] Batch SRCCs: {srccs}, Mean: {mean_srcc:.4f}")
+        return mean_srcc
 
     def _init_wandb(self):
         if not self._wandb_initialized and self.wandb_project is not None:
@@ -423,6 +454,31 @@ class VQGanVAETrainer(nn.Module):
                 logs['reconstructions'] = grid
 
                 save_image(grid, str(self.results_folder / f'{filename}.png'))
+
+                # --- Compute and log SRCC ---
+                srcc = self.compute_srcc(recons, valid_data)
+                logs['srcc'] = srcc
+                
+                # Add debugging information
+                print(f"[Debug] Step {steps}: Recons range=[{recons.min():.6f}, {recons.max():.6f}], Valid range=[{valid_data.min():.6f}, {valid_data.max():.6f}]")
+                print(f"[Debug] Step {steps}: Recons std={recons.std():.6f}, Valid std={valid_data.std():.6f}")
+                
+                if self._wandb is not None:
+                    self._wandb.log({f"valid/srcc_{filename}": srcc, "step": steps})
+                # Track best SRCC and save best model
+                if filename == str(steps) and srcc > self.best_srcc:
+                    self.best_srcc = srcc
+                    # Save best model
+                    state_dict = self.accelerator.unwrap_model(model).state_dict()
+                    model_path = str(self.results_folder / f'vae.best_srcc.pt')
+                    self.accelerator.save(state_dict, model_path)
+                    self.print(f"{steps}: new best SRCC {srcc:.4f}, saving best model to {model_path}")
+                if filename.endswith('.ema') and srcc > getattr(self, 'best_srcc_ema', -float('inf')):
+                    self.best_srcc_ema = srcc
+                    state_dict = self.accelerator.unwrap_model(model).state_dict()
+                    model_path = str(self.results_folder / f'vae.best_srcc.ema.pt')
+                    self.accelerator.save(state_dict, model_path)
+                    self.print(f"{steps}: new best EMA SRCC {srcc:.4f}, saving best EMA model to {model_path}")
 
             self.print(f'{steps}: saving to {str(self.results_folder)}')
 
