@@ -5,6 +5,7 @@ from math import sqrt
 from functools import partial, wraps
 
 from vector_quantize_pytorch import VectorQuantize as VQ, LFQ
+from muse_maskgit_pytorch.vqgan_vae import VQGanVAE as _BaseVQGanVAE
 
 import torch
 from torch import nn, einsum
@@ -289,9 +290,15 @@ def get_hic_weight_matrix(size, device=None, alpha=1.0):
     weights = 1.0 + alpha * (dist ** 2)
     return weights
 
+    # idx = torch.arange(size, device=device).float()
+    # dist = (idx[:, None] - idx[None, :]).abs()
+    # w = torch.log1p(dist)
+    # w = 1. + alpha * (w / w.mean())   # keep global scale ~1
+    # return w
+
 # main vqgan-vae classes
 
-class VQGanVAE(nn.Module):
+class VQGanVAE(_BaseVQGanVAE):
     def __init__(
         self,
         *,
@@ -317,67 +324,22 @@ class VQGanVAE(nn.Module):
         discr_layers = 4,
         **kwargs
     ):
-        super().__init__()
-        vq_kwargs, kwargs = groupby_prefix_and_trim('vq_', kwargs)
-        encdec_kwargs, kwargs = groupby_prefix_and_trim('encdec_', kwargs)
-
-        self.channels = channels
-        self.codebook_size = codebook_size
-        self.dim_divisor = 2 ** layers
-
-        enc_dec_klass = ResnetEncDec
-
-        self.enc_dec = enc_dec_klass(
-            dim = dim,
-            channels = channels,
-            layers = layers,
-            **encdec_kwargs
+        # Call parent constructor with all the required parameters
+        super().__init__(
+            dim=dim,
+            channels=channels,
+            layers=layers,
+            l2_recon_loss=l2_recon_loss,
+            use_hinge_loss=use_hinge_loss,
+            vgg=vgg,
+            lookup_free_quantization=lookup_free_quantization,
+            codebook_size=codebook_size,
+            vq_kwargs=vq_kwargs,
+            lfq_kwargs=lfq_kwargs,
+            use_vgg_and_gan=use_vgg_and_gan,
+            discr_layers=discr_layers,
+            **kwargs
         )
-
-        self.lookup_free_quantization = lookup_free_quantization
-
-        if lookup_free_quantization:
-            self.quantizer = LFQ(
-                dim = self.enc_dec.encoded_dim,
-                codebook_size = codebook_size,
-                **lfq_kwargs
-            )
-        else:
-            self.quantizer = VQ(
-                dim = self.enc_dec.encoded_dim,
-                codebook_size = codebook_size,
-                accept_image_fmap = True,
-                **vq_kwargs
-            )
-
-        # reconstruction loss
-
-        self.recon_loss_fn = F.mse_loss if l2_recon_loss else F.l1_loss
-
-        # turn off GAN and perceptual loss if grayscale
-
-        self._vgg = None
-        self.discr = None
-        self.use_vgg_and_gan = use_vgg_and_gan
-
-        if not use_vgg_and_gan:
-            return
-
-        # preceptual loss
-
-        if exists(vgg):
-            self._vgg = vgg
-
-        # gan related losses
-
-        layer_mults = list(map(lambda t: 2 ** t, range(discr_layers)))
-        layer_dims = [dim * mult for mult in layer_mults]
-        dims = (dim, *layer_dims)
-
-        self.discr = Discriminator(dims = dims, channels = channels)
-
-        self.discr_loss = hinge_discr_loss if use_hinge_loss else bce_discr_loss
-        self.gen_loss = hinge_gen_loss if use_hinge_loss else bce_gen_loss
 
     @property
     def device(self):
@@ -426,7 +388,7 @@ class VQGanVAE(nn.Module):
         path = Path(path)
         assert path.exists()
         state_dict = torch.load(str(path))
-        self.load_state_dict(state_dict)
+        self.load_state_dict(state_dict, strict = False)
 
     def encode(self, fmap):
         fmap = self.enc_dec.encode(fmap)
