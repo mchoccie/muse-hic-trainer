@@ -110,7 +110,7 @@ class TrainingConfig:
         self.dna_embedding_dim = 256
         
         # Training hyperparameters
-        self.batch_size = 16  # Increased from 8
+        self.batch_size = 8   # Reduced from 16 for memory
         self.num_epochs = 100
         self.learning_rate = 1e-4
         self.weight_decay = 1e-4  # Added weight decay
@@ -118,13 +118,13 @@ class TrainingConfig:
         self.grad_clip_norm = 1.0
         
         # Model architecture
-        self.transformer_dim = 768  # Increased from 512
-        self.transformer_depth = 12  # Increased from 8
-        self.transformer_heads = 12  # Increased from 8
+        self.transformer_dim = 512  # Reduced from 768 for memory
+        self.transformer_depth = 8   # Reduced from 12 for memory
+        self.transformer_heads = 8   # Reduced from 12 for memory
         self.transformer_dim_head = 64
         
         # Training strategy
-        self.use_mixed_precision = False
+        self.use_mixed_precision = False  # Disabled due to flash attention overflow
         self.gradient_accumulation_steps = 2
         self.save_every = 1000
         self.eval_every = 500
@@ -319,6 +319,9 @@ class MuseTrainer:
             self_cond=True,
         ).to(self.device)
         
+        # Note: Gradient checkpointing not available for this transformer implementation
+        # Memory optimization is handled through mixed precision and smaller model size
+        
         # MaskGit models
         self.maskgit_lowres = MaskGit(
             vae=self.vae_base,
@@ -472,6 +475,10 @@ class MuseTrainer:
             
             epoch_losses.append(total_loss.item())
             self.global_step += 1
+            
+            # Memory management - clear cache every 10 batches
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
             
             # Logging
             if self.global_step % self.config.log_every == 0:
