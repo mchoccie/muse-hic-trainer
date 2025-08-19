@@ -16,7 +16,12 @@ from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
 
 #from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
-from muse_maskgit_pytorch.vqgan_vae_hic_weighted import VQGanVAE
+# Import the HiC-weighted VAE from the root directory
+# if TYPE_CHECKING:
+#     import sys
+#     import os
+#     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+#     from vqgan_vae_hic_weighted import VQGanVAE
 
 from einops import rearrange
 
@@ -126,7 +131,7 @@ class HiCDataset(Dataset):
 class VQGanVAETrainer(nn.Module):
     def __init__(
         self,
-        vae: VQGanVAE,
+        vae,
         *,
         folder,
         num_train_steps,

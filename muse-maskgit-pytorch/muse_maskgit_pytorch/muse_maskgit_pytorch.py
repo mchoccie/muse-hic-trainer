@@ -192,14 +192,13 @@ class TransformerBlocks(nn.Module):
 
         self.norm = LayerNorm(dim)
 
-    def forward(self, x, context = None, context_mask = None):
+    def forward(self, x, context=None, context_mask=None):
         for attn, cross_attn, ff in self.layers:
             x = attn(x) + x
-
-            x = cross_attn(x, context = context, context_mask = context_mask) + x
-
+            # <- only do cross-attn if we actually have a context
+            if context is not None:
+                x = cross_attn(x, context=context, context_mask=context_mask) + x
             x = ff(x) + x
-
         return self.norm(x)
 
 # transformer - it's all we need

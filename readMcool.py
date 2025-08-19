@@ -1,224 +1,228 @@
-# import cooler, numpy as np, os, pybedtools
-# from pathlib import Path
-
-# # ------------------------------------------------------------------
-# # mappability BED (already produced with bedtools map/awk ≥0.7)
-# pass_bed = pybedtools.BedTool("/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/windows_with_mappability.bed")
-
-# def window_passes(chrom, start, end):
-#     """Return True if (chrom,start,end) is in the pass BED."""
-#     return bool(pass_bed.intersect(
-#         pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True),
-#         u=True))
-
-# # ------------------------------------------------------------------
-# # CONFIG
-# data_folder   = "Data/"
-# resolution    = 50000      # 50-kb bins
-# window_bins   = 256
-# stride        = 128
-# v_min_frac    = 0.05        # keep if ≥5 % non-zero
-# # ------------------------------------------------------------------
-
-# all_samples, window_coordinates = [], []
-
-# def slice_windows_with_coords(clr, chromosomes, resolution,
-#                               window_bins=256, stride=128):
-#     samples, coords = [], []
-
-#     for chrom in chromosomes:
-#         mat_chr = clr.matrix(balance=True).fetch(chrom)
-
-#         for i in range(0, mat_chr.shape[0] - window_bins + 1, stride):
-#             start_bp = i * resolution
-#             end_bp   = (i + window_bins) * resolution
-
-#             # ---- 1. mappability filter
-#             if not window_passes(chrom, start_bp, end_bp):
-#                 continue
-
-#             w = mat_chr[i:i+window_bins, i:i+window_bins]
-
-#             # ---- 2. skip if entire row/col is NaN   (bad region)
-#             if np.any(np.all(np.isnan(w), axis=0)) or np.any(np.all(np.isnan(w), axis=1)):
-#                 continue
-
-#             # ---- 3. skip if too sparse (<5 % non-zero)
-#             if np.count_nonzero(~np.isnan(w)) / w.size < v_min_frac:
-#                 continue
-
-#             # ---- 4. basic log-transform   (no Akita obs/exp etc.)
-#             w = np.nan_to_num(w, nan=0.0)   # replace NaNs with 0
-#             w = np.log1p(w).astype(np.float32)
-
-#             samples.append(w[None, ...])          # [1, 256, 256]
-#             coords.append((chrom, start_bp, end_bp))
-
-#     return samples, coords
-
-# # ------------------------------------------------------------------
-# for fname in os.listdir(data_folder):
-#     if not fname.endswith(".mcool"):
-#         continue
-
-#     clr = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{resolution}")
-#     chroms = [c for c in clr.chromnames if c != "chrY"]
-
-#     print(f"Processing {fname}")
-#     samples, coords = slice_windows_with_coords(clr, chroms,
-#                                                 resolution, window_bins, stride)
-#     all_samples.extend(samples)
-#     window_coordinates.extend(coords)
-
-# # ------------------------------------------------------------------
-# if all_samples:
-#     dataset = np.stack(all_samples)  # (N, 1, 256, 256)
-#     print("Final dataset shape:", dataset.shape)
-#     np.save("hic_dataset_50kb.npy", dataset)
-#     np.save("hic_window_coords.npy", np.array(window_coordinates, dtype=object))
-# else:
-#     print("No valid samples were collected.")
-
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Create *paired* low- and high-resolution Hi-C tiles (256×256 @50 kb
-and 512×512 @25 kb) that are perfectly matched base-pair–wise.
+Build paired Hi-C super-resolution datasets with:
+  - High-res tiles: 512x512 @ 25 kb (ground truth)
+  - Low-res tiles : 256x256 @ 50 kb (synthetic, via 2x coarsening)
+  - Stratum-wise z-score normalization
+  - Validity masks (hi & low) and distance maps saved separately
 
-Result:
-    ├── lowres_dataset.npy      (N, 1, 256, 256)  -- z-scored, float32
-    ├── highres_dataset.npy     (N, 1, 512, 512)  -- z-scored, float32
-    └── hic_window_coords.npy   (N,) object array  (chrom, start_bp, end_bp)
+Outputs:
+  lowres_dataset.npy        -> (N, 1, 256, 256)  [lo_norm]
+  lowres_mask.npy           -> (N, 1, 256, 256)  [lo_mask]
+  lowres_distance.npy       -> (N, 1, 256, 256)  [dist_lo]
+  highres_dataset.npy       -> (N, 1, 512, 512)  [hi_norm]
+  highres_mask.npy          -> (N, 1, 512, 512)  [hi_mask]
+  hic_window_coords.npy     -> (N,) object array of (chrom, start_bp, end_bp)
+  stratum_stats_hi_25k_512.npz, stratum_stats_lo_50k_256.npz
 """
 
-import os, cooler, numpy as np, pybedtools
-from scipy.ndimage import gaussian_filter
-from pathlib import Path
+import os
+import numpy as np
+import cooler
 
-# ----------------------------------------------------------------------
-# configuration
-# ----------------------------------------------------------------------
-data_folder       = "Data/"                 # directory with *.mcool files
+# --------------------------- Configuration ------------------------------------
+data_folder        = "Data"
+highres_res        = 25_000
+high_bins          = 512
 
-lowres_res        = 50_000                  # 50-kb resolution
-low_bins          = 256                     # 256×256 tiles
-low_stride_bins   = 128                     # stride in LOW-RES *bins*
+lowres_res         = 50_000
+low_bins           = 256
+low_stride_bins    = 128
 
-highres_res       = 25_000                  # 25-kb resolution
-high_bins         = 512                     # 512×512 tiles
-# stride_hi will be computed so windows align
+min_valid_frac     = 0.70
+skip_chrY          = True
 
-gauss_sigma       = 1.0                     # 0 = disable gaussian blur
-min_nonzero_frac  = 0.05                    # ≥5 % non-zero pixels
+use_mappability    = False
+mappability_bed    = "/path/to/windows_with_mappability.bed"
+min_weighted_map   = 0.50
 
-# ---------- optional mappability filter -------------------------------
-mappability_bed   = (
-    "/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/windows_with_mappability.bed"
-)
-use_mappability   = False                  # ← flip to True to enable
-min_weighted_map  = 0.50                   # keep if ≥50 % mappability
+save_stratum_stats = True
 
-# ----------------------------------------------------------------------
-# helper: mappability gate
-# ----------------------------------------------------------------------
-if use_mappability:
+# ---------------------- Optional mappability gate -----------------------------
+def make_window_passes():
+    if not use_mappability:
+        return lambda *args, **kwargs: True
+    try:
+        import pybedtools
+    except ImportError as e:
+        raise ImportError("use_mappability=True requires 'pybedtools'") from e
     pass_bed = pybedtools.BedTool(mappability_bed)
-
-    def window_passes(chrom, start, end, thresh=min_weighted_map):
+    def window_passes(chrom: str, start: int, end: int, thresh=min_weighted_map):
         q = pybedtools.BedTool(f"{chrom}\t{start}\t{end}", from_string=True)
-        total_len = end - start
+        total_len = max(1, end - start)
         score = 0.0
         for iv in pass_bed.intersect(q, wao=True):
             ov_len = int(iv[-1])
             try:
                 m = float(iv[3])
-            except ValueError:
+            except Exception:
                 continue
             score += m * ov_len
         return (score / total_len) >= thresh
-else:
-    def window_passes(*_args, **_kw):      # always passes
-        return True
+    return window_passes
 
-# ----------------------------------------------------------------------
-# extraction
-# ----------------------------------------------------------------------
-low_maps, high_maps, coords = [], [], []
-low_stride_bp = low_stride_bins * lowres_res
-high_stride_bins = low_stride_bp // highres_res  # ensures alignment
+window_passes = make_window_passes()
 
-for fname in sorted(os.listdir(data_folder)):
-    if not fname.endswith(".mcool"):
-        continue
+# --------------------------- Helpers ------------------------------------------
+def coarsen2_batch(x3: np.ndarray) -> np.ndarray:
+    N, H, W = x3.shape
+    H2, W2 = (H // 2) * 2, (W // 2) * 2
+    x3 = x3[:, :H2, :W2]
+    return x3.reshape(N, H2 // 2, 2, W2 // 2, 2).sum(axis=(2, 4))
 
-    print(f"\n>>> {fname}")
-    clr_lo = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{lowres_res}")
-    clr_hi = cooler.Cooler(f"{data_folder}/{fname}::resolutions/{highres_res}")
+def maxpool2_mask_batch(m3: np.ndarray) -> np.ndarray:
+    N, H, W = m3.shape
+    H2, W2 = (H // 2) * 2, (W // 2) * 2
+    m3 = m3[:, :H2, :W2]
+    return m3.reshape(N, H2 // 2, 2, W2 // 2, 2).max(axis=(2, 4)).astype(np.float32)
 
-    for chrom in clr_lo.chromnames:
-        if chrom == "chrY":          # skip chrY if desired
-            continue
+def distance_map(n: int) -> np.ndarray:
+    i = np.arange(n)
+    d = np.abs(i[:, None] - i[None, :]).astype(np.float32)
+    return d / max(1.0, d.max())
 
-        mat_lo = clr_lo.matrix(balance=True).fetch(chrom)
-        mat_hi = clr_hi.matrix(balance=True).fetch(chrom)
-
-        kept = 0
-        for i in range(0, mat_lo.shape[0] - low_bins + 1, low_stride_bins):
-            # genomic coordinates of the LOW-RES window
-            start_bp = i * lowres_res
-            end_bp   = start_bp + low_bins * lowres_res
-
-            if not window_passes(chrom, start_bp, end_bp):
+def fit_stratum_stats(X: np.ndarray, M: np.ndarray):
+    N, K, _ = X.shape
+    sums = np.zeros(K, dtype=np.float64)
+    sums2 = np.zeros(K, dtype=np.float64)
+    cnt = np.zeros(K, dtype=np.int64)
+    for n in range(N):
+        x = np.log1p(X[n])
+        m = M[n].astype(bool)
+        for d in range(K):
+            if K - d <= 0:
                 continue
-
-            lo = mat_lo[i : i + low_bins, i : i + low_bins]
-
-            # corresponding index in HIGH-RES bins
-            j = (start_bp // highres_res)
-            hi = mat_hi[j : j + high_bins, j : j + high_bins]
-
-            # sparsity check on *each* map
-            if (np.count_nonzero(lo) / lo.size < min_nonzero_frac or
-                np.count_nonzero(hi) / hi.size < min_nonzero_frac):
+            vals = np.diag(x, k=d)
+            mv   = np.diag(m, k=d)
+            vals = vals[mv]
+            if vals.size == 0:
                 continue
+            sums[d]  += vals.sum()
+            sums2[d] += (vals ** 2).sum()
+            cnt[d]   += vals.size
+    means = sums / np.maximum(cnt, 1)
+    var   = np.maximum(sums2 / np.maximum(cnt, 1) - means ** 2, 1e-6)
+    stds  = np.sqrt(var)
+    return means.astype(np.float32), stds.astype(np.float32)
 
-            # basic preprocessing ------------------------------------------------
-            lo = np.nan_to_num(np.log1p(lo), nan=0.0)
-            hi = np.nan_to_num(np.log1p(hi), nan=0.0)
+def apply_stratum_zscore_batch(X: np.ndarray, means: np.ndarray, stds: np.ndarray) -> np.ndarray:
+    N, K, _ = X.shape
+    idx = np.arange(K)
+    D = np.abs(idx[:, None] - idx[None, :])
+    Xl = np.log1p(X)
+    out = (Xl - means[D]) / (stds[D] + 1e-6)
+    return out.astype(np.float32)
 
-            if gauss_sigma > 0:
-                lo = gaussian_filter(lo, sigma=gauss_sigma)
-                hi = gaussian_filter(hi, sigma=gauss_sigma)
+# ----------------------------- Extraction -------------------------------------
+def main():
+    low_stride_bp = low_stride_bins * lowres_res
+    high_stride_bins = low_stride_bp // highres_res
 
-            # per-window z-score (good for VQGAN / MaskGit training)
-            lo = (lo - lo.mean()) / (lo.std() + 1e-6)
-            hi = (hi - hi.mean()) / (hi.std() + 1e-6)
-            # --------------------------------------------------------------------
+    hi_tiles, hi_masks, coords = [], [], []
+    mcools = [f for f in sorted(os.listdir(data_folder)) if f.endswith(".mcool")]
+    if not mcools:
+        raise FileNotFoundError(f"No .mcool files in {data_folder}")
 
-            low_maps.append(lo.astype(np.float32)[None, ...])   # shape (1,256,256)
-            high_maps.append(hi.astype(np.float32)[None, ...])  # shape (1,512,512)
-            coords.append((chrom, start_bp, end_bp))
-            kept += 1
+    for fname in mcools:
+        print(f"\n>>> {fname}")
+        clr_hi = cooler.Cooler(os.path.join(data_folder, f"{fname}::resolutions/{highres_res}"))
+        for chrom in clr_hi.chromnames:
+            if skip_chrY and chrom == "chrY":
+                continue
+            mat_hi = clr_hi.matrix(balance=False).fetch(chrom).astype(np.float32)
+            kept = 0
+            for j in range(0, mat_hi.shape[0] - high_bins + 1, high_stride_bins):
+                start_bp = j * highres_res
+                end_bp   = start_bp + high_bins * highres_res
+                if not window_passes(chrom, start_bp, end_bp):
+                    continue
+                hi = mat_hi[j:j + high_bins, j:j + high_bins]
+                mask = np.isfinite(hi).astype(np.float32)
+                if mask.mean() < min_valid_frac:
+                    continue
+                hi = np.nan_to_num(hi, nan=0.0)
+                hi_tiles.append(hi)
+                hi_masks.append(mask)
+                coords.append((chrom, int(start_bp), int(end_bp)))
+                kept += 1
+            print(f"  {chrom}: kept {kept} windows")
 
-        print(f"  {chrom}: kept {kept} windows")
+    if not hi_tiles:
+        print("\nNo windows satisfied the filters – nothing saved.")
+        return
 
-# ----------------------------------------------------------------------
-# save
-# ----------------------------------------------------------------------
-if not low_maps:
-    print("\nNo windows satisfied the filters – nothing saved.")
-    raise SystemExit
+    hi_tiles = np.stack(hi_tiles)  # (N, 512, 512)
+    hi_masks = np.stack(hi_masks)  # (N, 512, 512)
+    N = hi_tiles.shape[0]
 
-low_arr  = np.stack(low_maps)    # (N,1,256,256)
-high_arr = np.stack(high_maps)   # (N,1,512,512)
-coords_arr = np.array(coords, dtype=object)
+    print("\n--- After stacking raw tiles ---")
+    print("hi_tiles:", hi_tiles.shape, hi_tiles.dtype)
+    print("hi_masks:", hi_masks.shape, hi_masks.dtype)
+    print("valid frac (mean mask):", float(hi_masks.mean()))
 
-print(f"\nLOW  dataset : {low_arr.shape}")
-print(f"HIGH dataset : {high_arr.shape}")
-print(f"coords       : {coords_arr.shape}")
+    # Synthetic low-res (2x)
+    lo_counts = coarsen2_batch(hi_tiles)      # (N, 256, 256)
+    lo_masks  = maxpool2_mask_batch(hi_masks) # (N, 256, 256)
 
-np.save("lowres_dataset.npy",  low_arr)
-np.save("highres_dataset.npy", high_arr)
-np.save("hic_window_coords.npy", coords_arr)
+    print("\n--- After coarsening (2x) ---")
+    print("lo_counts:", lo_counts.shape, lo_counts.dtype)
+    print("lo_masks :", lo_masks.shape,  lo_masks.dtype)
 
-print("\nDone ✔")
+    # Stratum stats (fit on ALL here; in practice fit on TRAIN only)
+    hi_means, hi_stds = fit_stratum_stats(hi_tiles, hi_masks)
+    lo_means, lo_stds = fit_stratum_stats(lo_counts, lo_masks)
+
+    print("\n--- Stratum stats ---")
+    print("hi_means/stds:", hi_means.shape, hi_stds.shape)
+    print("lo_means/stds:", lo_means.shape, lo_stds.shape)
+
+    # Apply stratum z-score
+    hi_norm = apply_stratum_zscore_batch(hi_tiles, hi_means, hi_stds)  # (N,512,512)
+    lo_norm = apply_stratum_zscore_batch(lo_counts, lo_means, lo_stds) # (N,256,256)
+
+    print("\n--- After stratum z-score ---")
+    print("hi_norm:", hi_norm.shape, hi_norm.dtype)
+    print("lo_norm:", lo_norm.shape, lo_norm.dtype)
+
+    # Package tensors (ONE CHANNEL for images)
+    dist_lo = np.broadcast_to(distance_map(low_bins),  (N, low_bins,  low_bins)).astype(np.float32)
+
+    lowres_img   = lo_norm[:, None, :, :].astype(np.float32)     # (N,1,256,256)
+    lowres_mask  = lo_masks[:, None, :, :].astype(np.float32)    # (N,1,256,256)
+    lowres_dist  = dist_lo[:, None, :, :].astype(np.float32)     # (N,1,256,256)
+
+    highres_img   = hi_norm[:, None, :, :].astype(np.float32)    # (N,1,512,512)
+    highres_mask  = hi_masks[:, None, :, :].astype(np.float32)   # (N,1,512,512)
+
+    # Save
+    np.save("lowres_dataset_gpt5.npy",        lowres_img)
+    np.save("lowres_mask_gpt5.npy",           lowres_mask)
+    np.save("lowres_distance_gpt5.npy",       lowres_dist)
+    np.save("highres_dataset_gpt5.npy",       highres_img)
+    np.save("highres_mask_gpt5.npy",          highres_mask)
+    np.save("hic_window_coords_gpt5.npy",     np.array(coords, dtype=object))
+
+    if save_stratum_stats:
+        np.savez("stratum_stats_hi_25k_512_gpt5.npz", means=hi_means, stds=hi_stds)
+        np.savez("stratum_stats_lo_50k_256_gpt5.npz", means=lo_means, stds=lo_stds)
+
+    # Final prints
+    print("\n--- Final tensors ---")
+    print("lowres_dataset :", lowres_img.shape,  lowres_img.dtype)
+    print("lowres_mask    :", lowres_mask.shape, lowres_mask.dtype)
+    print("lowres_distance:", lowres_dist.shape, lowres_dist.dtype)
+    print("highres_dataset:", highres_img.shape, highres_img.dtype)
+    print("highres_mask   :", highres_mask.shape, highres_mask.dtype)
+    print(f"\nSaved {N} datapoints")
+    assert N == highres_img.shape[0] == highres_mask.shape[0] == len(coords)
+
+    total_bytes = (lowres_img.nbytes + lowres_mask.nbytes + lowres_dist.nbytes +
+                   highres_img.nbytes + highres_mask.nbytes)
+    print(f"Estimated RAM for saved arrays: {total_bytes/1e6:.1f} MB")
+    print("\nDone ✔")
+
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
