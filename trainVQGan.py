@@ -55,46 +55,88 @@ from vqgan_vae_hic_weighted import VQGanVAE
 # trainer from the package (ensure its type hint was changed to nn.Module as we discussed)
 from muse_maskgit_pytorch import VQGanVAETrainer
 
+# LOWRES_NPY   = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/lowres_dataset_gpt5.npy'  # (N,1,256,256)
+# RESULTS_DIR  = './vq_lowres_results_gpt5'
+# WANDB_PROJECT = 'vqgan-hic-training'
+# WANDB_RUN     = 'vqgan-lowres-gpt5'
+
+# # ---- VAE for LOW-RES tiles (256x256) ----
+# # vae = VQGanVAE(
+# #     dim = 256,                 # low-res encoder width (matches your previous setup)
+# #     channels = 1,
+# #     layers = 4,                # 256 -> 16x16 latent grid
+# #     codebook_size = 1024,      # vocab size for 16x16 tokens
+# #     lookup_free_quantization = False,  # must match how you trained the checkpoint
+# #     vq_kwargs = dict(
+# #         codebook_dim      = 256,
+# #         commitment_weight = 0.4,
+# #         decay             = 0.99
+# #     ),
+# #     # Reconstruction: L1 (no perceptual/GAN for Hi-C)
+# #     l2_recon_loss = False,
+# #     use_vgg_and_gan = False
+# # )
+
+# # trainer = VQGanVAETrainer(
+# #     vae = vae,
+# #     image_size = 256,                       # LOW-RES stage
+# #     folder = LOWRES_NPY,                    # path to (N,1,256,256) NPY
+# #     batch_size = 16,                        # adjust per GPU memory
+# #     grad_accum_every = 4,                   # effective batch 16*4=64
+# #     num_train_steps = 20_000,               # typical for low-res
+
+# #     results_folder = RESULTS_DIR,
+
+# #     # Plain L1 is recommended for Hi-C (no diagonal weighting)
+# #     use_hic_weighted_loss = False,
+# #     hic_weight_alpha = 0.7,                 # ignored when use_hic_weighted_loss=False
+
+# #     codebook_log_interval = 200,
+# #     wandb_project = WANDB_PROJECT,
+# #     wandb_run_name = WANDB_RUN
+# # )
+
 # ---------------- config ----------------
 HIGHRES_NPY = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/highres_dataset_gpt5.npy'  # shape (N,1,512,512)
-RESULTS_DIR = './vq_highres_results_gpt5'
+RESULTS_DIR = './vq_highres_results_gpt5_layer_adjusted_codebook_512'
 WANDB_PROJECT = 'vqgan-hic-training'
 WANDB_RUN = 'vqgan-highres-gpt5'
 
-# ---- VAE for HIGH-RES tiles (512x512) ----
 vae = VQGanVAE(
-    dim = 384,                 # 384–512 work; 384 is lighter on memory
+    dim = 256,
     channels = 1,
-    layers = 4,                # 512 -> 32x32 latent grid
-    codebook_size = 2048,      # 1024–2048 typical for 512x512 Hi-C
+    layers = 3,                 # 512 -> 64x64 latent (4096 tokens)
+    codebook_size = 512,        # ⬅️ smaller, match folder + improve effective usage
     lookup_free_quantization = False,
     vq_kwargs = dict(
-        codebook_dim      = 256,   # 256–384; 256 is usually enough
-        commitment_weight = 0.4,   # 0.3–0.5 stable
-        decay             = 0.99
+        codebook_dim      = 256,
+        commitment_weight = 0.72,  # ⬆️ nudge encoder to actually use codes
+        decay             = 0.99    # ⬇️ quicker EMA so dead-ish codes revive
     ),
-    # Reconstruction: L1 (no perceptual/GAN for Hi-C)
     l2_recon_loss = False,
     use_vgg_and_gan = False
 )
 
 trainer = VQGanVAETrainer(
     vae = vae,
-    image_size = 512,                         # HIGH-RES stage
-    folder = HIGHRES_NPY,                     # (N,1,512,512) NPY
-    batch_size = 4,                           # adjust per GPU
-    grad_accum_every = 8,                     # raises effective batch
-    num_train_steps = 50_000,                # train longer for hi-res
+    image_size = 512,
+    folder = HIGHRES_NPY,
+    batch_size = 4,
+    grad_accum_every = 8,
+    num_train_steps = 30_000,
     results_folder = RESULTS_DIR,
 
-    # optional weighted L1 (diagonal distance), safe to disable if you prefer plain L1
     use_hic_weighted_loss = True,
-    hic_weight_alpha = 0.7,
+
+    # ⬇️ replace fixed alpha with a schedule if your trainer supports it.
+    # If not, set 0.65 here as a compromise and ignore the schedule below.
+    hic_weight_alpha = 0.65,
 
     codebook_log_interval = 200,
     wandb_project = WANDB_PROJECT,
     wandb_run_name = WANDB_RUN
 )
 
-
 trainer.train()
+
+

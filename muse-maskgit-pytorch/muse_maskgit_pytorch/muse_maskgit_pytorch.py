@@ -236,9 +236,9 @@ class Transformer(nn.Module):
         self.dna_encoder = dna_encoder
         dna_dim = None
         if dna_encoder is not None:
-            # Test encode to get the dimension
             test_coords = [('chr1', 0, 12800000)]
-            test_embedding = dna_encoder.encode(test_coords)
+            with torch.no_grad():
+                test_embedding = dna_encoder.encode(test_coords)  # [1, T, E] or [1,1,E]
             dna_dim = test_embedding.shape[-1]
 
         text_embed_dim = dna_dim if dna_dim is not None else get_encoded_dim(t5_name)
@@ -248,6 +248,12 @@ class Transformer(nn.Module):
         # optional self conditioning
         self.self_cond = self_cond
         self.self_cond_to_init_embed = FeedForward(dim)
+
+    # optional (kept so negative prompting etc. won’t crash if used later)
+    def encode_text(self, texts: Optional[List[str]]):
+        if texts is None:
+            return None
+        return t5_encode_text(texts, name=self.t5_name)
 
     def forward_with_cond_scale(
         self,
@@ -291,13 +297,14 @@ class Transformer(nn.Module):
     def forward(
         self,
         x,
-        return_embed = False,
+        *,
+        return_embed=False,
         dna_coords: Optional[List[tuple]] = None,
-        return_logits = False,
-        labels = None,
-        ignore_index = 0,
-        self_cond_embed = None,
-        cond_drop_prob = 0.,
+        return_logits=False,
+        labels=None,
+        ignore_index=0,
+        self_cond_embed=None,
+        cond_drop_prob=0.,
         conditioning_token_ids: Optional[torch.Tensor] = None,
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None
@@ -305,56 +312,54 @@ class Transformer(nn.Module):
         device, b, n = x.device, *x.shape
         assert n <= self.seq_len
 
-        if self.dna_encoder is not None:
-            # dna encoder wins unless user overrides with text_embeds
-            assert text_embeds is None and texts is None, \
-                "don't pass both DNA and text"
-            assert dna_coords is not None, "dna_coords required"
-            # Ensure DNA encoder is on the same device as input
-            if next(self.dna_encoder.parameters()).device != x.device:
-                self.dna_encoder = self.dna_encoder.to(x.device)
-            context = self.dna_encoder.encode(dna_coords)  # [B, 1, E]
-        else:
-            # fall back to text
-            if text_embeds is None:
-                text_embeds = self.encode_text(texts).to(x.device)      # [B, T, E]
-            context = text_embeds
+        # -------------------- build context (DNA/text) if present
+        context = None
+        context_mask = None
 
-        # Ensure context is on the same device as input
-        context = context.to(x.device)
+        if self.dna_encoder is not None and dna_coords is not None:
+            # keep dna encoder on same device
+            self.dna_encoder = self.dna_encoder.to(device)
+            context = self.dna_encoder.encode(dna_coords)      # [B, T, E] or [B, 1, E]
+            context = context.to(device)
+        elif text_embeds is not None:
+            context = text_embeds.to(device)
+        elif texts is not None:
+            context = self.encode_text(texts).to(device)
 
-        context = self.text_embed_proj(context)
+        if context is not None:
+            context = self.text_embed_proj(context)
+            context_mask = (context != 0).any(dim=-1)   # [B, T_ctx]
 
-        context_mask = (context != 0).any(dim = -1)
-
-        
-
-        # classifier free guidance
-
-        if cond_drop_prob > 0.:
-            mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device)
-            context_mask = context_mask & mask
-
-        # concat conditioning image token ids if needed
-
+        # -------------------- append conditioning tokens (low-res) as context
         if exists(conditioning_token_ids):
-            conditioning_token_ids = rearrange(conditioning_token_ids, 'b ... -> b (...)')
-            cond_token_emb = self.token_emb(conditioning_token_ids)
-            context = torch.cat((context, cond_token_emb), dim = -2)
-            context_mask = F.pad(context_mask, (0, conditioning_token_ids.shape[-1]), value = True)
+            conditioning_token_ids = rearrange(conditioning_token_ids, 'b ... -> b (...)')   # [B, Lc]
+            cond_token_emb = self.token_emb(conditioning_token_ids)                          # [B, Lc, D]
+            if context is None:
+                context = cond_token_emb
+                context_mask = torch.ones(context.shape[:-1], dtype=torch.bool, device=device)
+            else:
+                context = torch.cat((context, cond_token_emb), dim=-2)
+                cond_mask = torch.ones((context.shape[0], conditioning_token_ids.shape[-1]),
+                                       dtype=torch.bool, device=device)
+                context_mask = torch.cat((context_mask, cond_mask), dim=-1)
 
-        # embed tokens
+        # classifier-free guidance dropout on context
+        if cond_drop_prob > 0. and context is not None:
+            # drop entire context with prob
+            keep = prob_mask_like((b, 1), 1. - cond_drop_prob, device)
+            context_mask = context_mask & keep
 
+        # -------------------- token + pos embeddings
         x = self.token_emb(x)
-        x = x + self.pos_emb(torch.arange(n, device = device))
+        x = x + self.pos_emb(torch.arange(n, device=device))
 
         if self.self_cond:
             if not exists(self_cond_embed):
                 self_cond_embed = torch.zeros_like(x)
             x = x + self.self_cond_to_init_embed(self_cond_embed)
 
-        embed = self.transformer_blocks(x, context = context, context_mask = context_mask)
-
+        # -------------------- transformer
+        embed = self.transformer_blocks(x, context=context, context_mask=context_mask)
         logits = self.to_logits(embed)
 
         if return_embed:
@@ -364,9 +369,9 @@ class Transformer(nn.Module):
             return logits
 
         if self.dim_out == 1:
-            loss = F.binary_cross_entropy_with_logits(rearrange(logits, '... 1 -> ...'), labels)
+            loss = F.binary_cross_entropy_with_logits(rearrange(logits, '... 1 -> ...'), labels.float())
         else:
-            loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index = ignore_index)
+            loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index=ignore_index)
 
         if not return_logits:
             return loss
@@ -397,7 +402,7 @@ class SelfCritic(nn.Module):
             return logits
 
         logits = rearrange(logits, '... 1 -> ...')
-        return F.binary_cross_entropy_with_logits(logits, labels)
+        return F.binary_cross_entropy_with_logits(logits, labels.float())
 
 # specialized transformers
 
@@ -518,7 +523,7 @@ class MaskGit(nn.Module):
     @eval_decorator
     def generate(
         self,
-        texts: List[str],
+        texts: Optional[List[str]] = None,
         dna_coords: Optional[List[Tuple[str, int, int]]] = None,
         negative_texts: Optional[List[str]] = None,
         cond_images: Optional[torch.Tensor] = None,
@@ -527,128 +532,89 @@ class MaskGit(nn.Module):
         topk_filter_thres = 0.9,
         can_remask_prev_masked = False,
         force_not_use_token_critic = False,
-        timesteps = 18,  # ideal number of steps is 18 in maskgit paper
+        timesteps = 18,
         cond_scale = 3,
         critic_noise_scale = 1
     ):
-        fmap_size = default(fmap_size, self.vae.get_encoded_fmap_size(self.image_size))
-
-        # begin with all image token ids masked
-
         device = next(self.parameters()).device
-
+        fmap_size = default(fmap_size, self.vae.get_encoded_fmap_size(self.image_size))
         seq_len = fmap_size ** 2
 
-        batch_size = len(texts)
+        # infer batch size from inputs
+        if cond_images is not None:
+            batch_size = cond_images.shape[0]
+        elif dna_coords is not None:
+            batch_size = len(dna_coords)
+        elif texts is not None:
+            batch_size = len(texts)
+        else:
+            raise ValueError("Need at least one of cond_images, dna_coords, or texts to determine batch size.")
 
-        shape = (batch_size, seq_len)
-
-        ids = torch.full(shape, self.mask_id, dtype = torch.long, device = device)
-        scores = torch.zeros(shape, dtype = torch.float32, device = device)
-
-        starting_temperature = temperature
+        ids = torch.full((batch_size, seq_len), self.mask_id, dtype=torch.long, device=device)
+        scores = torch.zeros_like(ids, dtype=torch.float32)
 
         cond_ids = None
-        
-        #text_embeds = self.transformer.encode_text(texts)
+        if self.resize_image_for_cond_image:
+            assert exists(cond_images), 'conditioning image must be passed for super-res'
+            _, cond_ids, _ = self.cond_vae.encode(cond_images)
 
-        # Use DNA encoder directly instead of non-existent encode_dna method
-        text_embeds = self.transformer.dna_encoder.encode(dna_coords)
+        # build (optional) context embeddings only if you provided DNA or text
+        text_embeds = None
+        if self.transformer.dna_encoder is not None and dna_coords is not None:
+            text_embeds = self.transformer.dna_encoder.encode(dna_coords)
+        elif texts is not None:
+            text_embeds = self.transformer.encode_text(texts)
 
         demask_fn = self.transformer.forward_with_cond_scale
 
-        # whether to use token critic for scores
-
         use_token_critic = exists(self.token_critic) and not force_not_use_token_critic
-
         if use_token_critic:
             token_critic_fn = self.token_critic.forward_with_cond_scale
 
-        # negative prompting, as in paper
-
-        neg_text_embeds = None
-        if exists(negative_texts):
-            assert len(texts) == len(negative_texts)
-
-            neg_text_embeds = self.transformer.encode_text(negative_texts)
-            demask_fn = partial(self.transformer.forward_with_neg_prompt, neg_text_embeds = neg_text_embeds)
-
-            if use_token_critic:
-                token_critic_fn = partial(self.token_critic.forward_with_neg_prompt, neg_text_embeds = neg_text_embeds)
-
-        if self.resize_image_for_cond_image:
-            assert exists(cond_images), 'conditioning image must be passed in to generate for super res maskgit'
-            with torch.no_grad():
-                _, cond_ids, _ = self.cond_vae.encode(cond_images)
-
         self_cond_embed = None
+        start_temp = temperature
 
-        for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
-
-            rand_mask_prob = self.noise_schedule(timestep)
-            num_token_masked = max(int((rand_mask_prob * seq_len).item()), 1)
-
-            masked_indices = scores.topk(num_token_masked, dim = -1).indices
-
-            ids = ids.scatter(1, masked_indices, self.mask_id)
+        for step, steps_left in tqdm(zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))), total=timesteps):
+            mask_ratio = self.noise_schedule(step)
+            k = max(int((mask_ratio * seq_len).item()), 1)
+            masked_idx = scores.topk(k, dim=-1).indices
+            ids.scatter_(1, masked_idx, self.mask_id)
 
             logits, embed = demask_fn(
                 ids,
-                text_embeds = text_embeds,
-                self_cond_embed = self_cond_embed,
-                conditioning_token_ids = cond_ids,
-                cond_scale = cond_scale,
-                return_embed = True
+                text_embeds=text_embeds,           # can be None
+                conditioning_token_ids=cond_ids,   # low-res tokens if provided
+                self_cond_embed=self_cond_embed,
+                cond_scale=cond_scale,
+                return_embed=True
             )
+            if self.self_cond:
+                self_cond_embed = embed
 
-            self_cond_embed = embed if self.self_cond else None
+            logits = top_k(logits, topk_filter_thres)
+            temp = start_temp * (steps_left / timesteps)
+            pred_ids = gumbel_sample(logits, temperature=temp, dim=-1)
 
-            filtered_logits = top_k(logits, topk_filter_thres)
-
-            temperature = starting_temperature * (steps_until_x0 / timesteps) # temperature is annealed
-
-            pred_ids = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
-
-            is_mask = ids == self.mask_id
-
-            ids = torch.where(
-                is_mask,
-                pred_ids,
-                ids
-            )
+            is_mask = (ids == self.mask_id)
+            ids = torch.where(is_mask, pred_ids, ids)
 
             if use_token_critic:
-                scores = token_critic_fn(
+                sc = token_critic_fn(
                     ids,
-                    text_embeds = text_embeds,
-                    conditioning_token_ids = cond_ids,
-                    cond_scale = cond_scale
-                )
-
-                scores = rearrange(scores, '... 1 -> ...')
-
-                scores = scores + (uniform(scores.shape, device = device) - 0.5) * critic_noise_scale * (steps_until_x0 / timesteps)
-
+                    text_embeds=text_embeds,
+                    conditioning_token_ids=cond_ids,
+                    cond_scale=cond_scale
+                ).squeeze(-1)
+                sc = sc + (uniform(sc.shape, device=device) - 0.5) * critic_noise_scale * (steps_left / timesteps)
+                scores = sc
             else:
-                probs_without_temperature = logits.softmax(dim = -1)
-
-                scores = 1 - probs_without_temperature.gather(2, pred_ids[..., None])
-                scores = rearrange(scores, '... 1 -> ...')
-
+                probs = logits.softmax(-1)
+                scores = 1 - probs.gather(2, pred_ids[..., None]).squeeze(-1)
                 if not can_remask_prev_masked:
-                    scores = scores.masked_fill(~is_mask, -1e5)
-                else:
-                    assert self.no_mask_token_prob > 0., 'without training with some of the non-masked tokens forced to predict, not sure if the logits will be meaningful for these token'
+                    scores.masked_fill_(~is_mask, -1e5)
 
-        # get ids
-
-        ids = rearrange(ids, 'b (i j) -> b i j', i = fmap_size, j = fmap_size)
-
-        if not exists(self.vae):
-            return ids
-
-        images = self.vae.decode_from_ids(ids)
-        return images
+        ids = rearrange(ids, 'b (h w) -> b h w', h=fmap_size)
+        return self.vae.decode_from_ids(ids)
     
     
 
