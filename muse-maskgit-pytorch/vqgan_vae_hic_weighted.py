@@ -282,19 +282,21 @@ class ResBlock(nn.Module):
         return self.net(x) + x
 
 # --- Hi-C weighted loss helper ---
-def get_hic_weight_matrix(size, device=None, alpha=1.0):
-    """Returns a [size, size] weight matrix for Hi-C loss, with harsher penalties further from diagonal."""
-    idx = torch.arange(size, device=device)
-    dist = torch.abs(idx[:, None] - idx[None, :])
-    # Example: quadratic penalty
-    weights = 1.0 + alpha * (dist ** 2)
-    return weights
+def get_hic_weight_matrix(size, device=None, alpha=1.0, eps=1e-3):
+    """
+    Returns a [size, size] weight matrix for Hi-C loss.
+    - Higher weights near diagonal (short/mid contacts)
+    - Weights decay smoothly for long-range contacts
+    """
+    idx = torch.arange(size, device=device).float()
+    dist = (idx[:, None] - idx[None, :]).abs()  # distance from diagonal
 
-    # idx = torch.arange(size, device=device).float()
-    # dist = (idx[:, None] - idx[None, :]).abs()
-    # w = torch.log1p(dist)
-    # w = 1. + alpha * (w / w.mean())   # keep global scale ~1
-    # return w
+    # Inverse weighting: 1 / (1 + alpha * dist)
+    weights = 1.0 / (1.0 + alpha * dist)
+
+    # Normalize so average weight ≈ 1
+    weights = weights / weights.mean().clamp_min(eps)
+    return weights
 
 # main vqgan-vae classes
 
@@ -461,12 +463,16 @@ class VQGanVAE(_BaseVQGanVAE):
         if use_hic_weighted_loss:
             B, C, H, W = fmap.shape
             weight_matrix = get_hic_weight_matrix(H, device=fmap.device, alpha=hic_weight_alpha)  # [H, W]
-            # Expand to [B, C, H, W]
             weight_matrix = weight_matrix[None, None, :, :].expand(B, C, H, W)
+
             # Per-pixel L1 loss
             per_pixel_loss = torch.abs(fmap - img)
+
             weighted_loss = (per_pixel_loss * weight_matrix).mean()
-            recon_loss = weighted_loss
+            plain_loss = per_pixel_loss.mean()
+
+            # Blend: mostly plain, some weighted
+            recon_loss = 0.7 * plain_loss + 0.3 * weighted_loss
         else:
             recon_loss = self.recon_loss_fn(fmap, img)
 

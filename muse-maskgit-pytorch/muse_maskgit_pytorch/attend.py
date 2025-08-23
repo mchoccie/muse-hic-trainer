@@ -5,6 +5,7 @@ from collections import namedtuple
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+from einops import einsum as einops_einsum
 
 from memory_efficient_attention_pytorch.flash_attention import FlashAttentionFunction
 # constants
@@ -91,18 +92,32 @@ class Attend(nn.Module):
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
         try:
-            raise Exception()
+            # Use PyTorch's built-in scaled_dot_product_attention for better BF16 support
             with torch.backends.cuda.sdp_kernel(**self.cuda_config._asdict()):
                 out = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask = mask,
                     dropout_p = self.dropout if self.training else 0.
                 )
-        except:
-            print_once('no hardware detected, falling back to naive implementation from memory-efficient-attention-pytorch library')
+        except Exception as e:
+            print_once(f'Flash attention failed, falling back to standard attention: {e}')
             self.no_hardware_detected = True
+            
+            # Use standard attention instead of memory-efficient attention
+            # similarity
+            sim = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
 
-            out = FlashAttentionFunction.apply(q, k, v, mask, False, 512, 512)
+            # masking
+            if exists(mask):
+                mask_value = -torch.finfo(sim.dtype).max
+                sim = sim.masked_fill(~mask, mask_value)
+
+            # attention
+            attn = sim.softmax(dim = -1)
+            attn = self.attn_dropout(attn)
+
+            # aggregate values
+            out = einsum("b h i j, b h j d -> b h i d", attn, v)
 
         return out
 
