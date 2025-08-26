@@ -43,7 +43,7 @@ if __name__ == "__main__":
         l2_recon_loss=False, use_vgg_and_gan=False
     )
     high_cfg = dict(
-        dim=256, channels=1, layers=3, codebook_size=1024,
+        dim=384, channels=1, layers=4, codebook_size=2048,
         lookup_free_quantization=False,
         vq_kwargs=dict(codebook_dim=256, commitment_weight=0.65, decay=0.995),
         l2_recon_loss=False, use_vgg_and_gan=False
@@ -51,7 +51,7 @@ if __name__ == "__main__":
 
     # --- your paths ---
     low_path  = "/scratch/rnd-rojas/Manan/vq_lowres_results_gpt5/vae.best_pearson_corr.pt"
-    high_path = "/scratch/rnd-rojas/Manan/vq_highres_results_gpt5_layer_adjusted/vae.9000.pt"
+    high_path = "/scratch/rnd-rojas/Manan/vq_highres_results_gpt5/vae.best_pearson_corr.pt"
 
     probe_checkpoint(low_path,  image_size=256, vae_cfg=low_cfg)
     probe_checkpoint(high_path, image_size=512, vae_cfg=high_cfg)

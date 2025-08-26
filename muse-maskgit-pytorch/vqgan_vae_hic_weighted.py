@@ -404,7 +404,7 @@ class VQGanVAE(_BaseVQGanVAE):
             fmap = self.quantizer.indices_to_codes(ids)
             fmap, = unpack(fmap, ps, 'b * c')
         else:
-            codes = self.codebook[ids]
+            codes = self.quantizer.codebook[ids]
             fmap = self.quantizer.project_out(codes)
 
         fmap = rearrange(fmap, 'b h w c -> b c h w')
