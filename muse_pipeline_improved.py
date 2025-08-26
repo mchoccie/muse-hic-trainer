@@ -221,7 +221,7 @@ class TrainingConfig:
 
         # pretrained VAE checkpoints
         self.vae_base_path    = "/scratch/rnd-rojas/Manan/vq_lowres_results_gpt5/vae.best_pearson_corr.pt"
-        self.vae_highres_path = "/scratch/rnd-rojas/Manan/vq_highres_results_gpt5_layer_adjusted/vae.9000.pt"
+        self.vae_highres_path = "/scratch/rnd-rojas/Manan/vq_highres_results_gpt5_layer_adjusted/vae.best_pearson_corr.pt"
 
         # DNA conditioning (off for now, can enable later)
         self.use_dna = False
@@ -253,7 +253,7 @@ class TrainingConfig:
         self.save_every = 1_000
 
         # mask schedule: anneal high → low
-        self.mask_start = 0.90
+        self.mask_start = 0.60
         self.mask_end   = 0.30
 
         # other
@@ -417,7 +417,7 @@ class MuseTrainer:
         ).to(self.device)
 
         self.maskgit_high = MaskGit(
-            vae=self.vae_high, transformer=self.tr_high, image_size=512,
+            vae=self.vae_high, transformer=self.tr_high, image_size=512, cond_vae=self.vae_base, 
             cond_image_size=256, cond_drop_prob=0.1, self_cond_prob=0.9, no_mask_token_prob=0.1
         ).to(self.device)
 
