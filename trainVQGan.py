@@ -97,40 +97,50 @@ from muse_maskgit_pytorch import VQGanVAETrainer
 # # )
 
 # ---------------- config ----------------
-HIGHRES_NPY = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/highres_dataset_gpt5.npy'  # shape (N,1,512,512)
-RESULTS_DIR = './vq_highres_results_gpt5_layer_adjusted_codebook_512'
+# ---------------- config ----------------
+HIGHRES_NPY   = '/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/ds25kb_lowdepth_dataset.npy'
+RESULTS_DIR   = './vq_highres_results_downsample_detailedPreprocessing_lowres'
 WANDB_PROJECT = 'vqgan-hic-training'
-WANDB_RUN = 'vqgan-highres-gpt5'
+WANDB_RUN     = 'vqgan-highres-downsample-k4096'
+
+# from muse_maskgit_pytorch import VQGanVAE, VQGanVAETrainer
 
 vae = VQGanVAE(
     dim = 256,
     channels = 1,
-    layers = 3,                 # 512 -> 64x64 latent (4096 tokens)
-    codebook_size = 512,        # ⬅️ smaller, match folder + improve effective usage
-    lookup_free_quantization = False,
+    layers = 3,                  # 512 -> 64x64 latent (4096 tokens)
+    codebook_size = 4096,        # solid, stable size for 512px Hi-C
+    lookup_free_quantization = False,   # EMA codebook
+
     vq_kwargs = dict(
         codebook_dim      = 256,
-        commitment_weight = 0.72,  # ⬆️ nudge encoder to actually use codes
-        decay             = 0.99    # ⬇️ quicker EMA so dead-ish codes revive
+        # Slightly lower commitment to encourage healthier codebook usage
+        # (reduces over-smoothing and dead codes vs 0.55)
+        commitment_weight = 0.40,
+        # Slower EMA is generally more stable at 512px + k=4096
+        decay             = 0.995
     ),
-    l2_recon_loss = False,
-    use_vgg_and_gan = False
+
+    # Keep L2 per your note (Huber/L1 is also fine if your fork supports it)
+    l2_recon_loss = True,
+    use_vgg_and_gan = False,
 )
 
 trainer = VQGanVAETrainer(
     vae = vae,
     image_size = 512,
     folder = HIGHRES_NPY,
+
     batch_size = 4,
     grad_accum_every = 8,
-    num_train_steps = 30_000,
+    num_train_steps = 60_000,     # keep your longer run
+
     results_folder = RESULTS_DIR,
 
+    # Hi-C weighted loss
+    # 0.5–0.6 is a good starting band; 0.65 can over-focus diagonal early
     use_hic_weighted_loss = True,
-
-    # ⬇️ replace fixed alpha with a schedule if your trainer supports it.
-    # If not, set 0.65 here as a compromise and ignore the schedule below.
-    hic_weight_alpha = 0.65,
+    hic_weight_alpha = 0.55,
 
     codebook_log_interval = 200,
     wandb_project = WANDB_PROJECT,

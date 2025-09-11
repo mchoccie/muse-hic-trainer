@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
+import matplotlib.pyplot as plt
 
 # ---- your packages ----
 from muse_maskgit_pytorch import MaskGit, MaskGitTransformer
@@ -74,6 +75,74 @@ def ensure_coord_tuples(coords):
         else:
             raise TypeError(f"Bad coord type {type(c)}: {c}")
     return out
+
+@torch.no_grad()
+def build_mask_like_forward(maskgit, images_or_ids):
+    """
+    Recreates MaskGit.forward() masking:
+      - tokenizes if floats
+      - uses maskgit.noise_schedule(t)
+      - guarantees at least 1 token masked (clamp(min=1))
+    Returns (ids_flat, mask_bool, f) where:
+      ids_flat : (B, S) original token ids
+      mask_bool: (B, S) boolean mask (True where masked)
+      f        : latent fmap size (e.g. 64 for 512px)
+    """
+    # tokenize if needed
+    if images_or_ids.dtype == torch.float:
+        _, ids, _ = maskgit.vae.encode(images_or_ids)     # (B, f, f)
+    else:
+        ids = images_or_ids
+
+    B, f, _ = ids.shape
+    ids_flat = ids.view(B, -1)
+    S = ids_flat.size(1)
+    device = ids_flat.device
+
+    # same randomness as forward()
+    t = torch.rand((B,), device=device)
+    mask_ratio = maskgit.noise_schedule(t)               # tensor in [0, max_ratio]
+    # safety: if the schedule accidentally returns a python float, tensor-ize it
+    if not torch.is_tensor(mask_ratio):
+        mask_ratio = torch.tensor(mask_ratio, device=device).expand(B)
+    k = (S * mask_ratio).round().clamp(min=1).long()     # at least 1 token masked
+
+    # random positions
+    perm = torch.rand((B, S), device=device).argsort(dim=-1)
+    mask_bool = perm < k[:, None]                        # (B, S) True where masked
+    return ids_flat, mask_bool, f
+
+def visualize_mask_once(maskgit, img, step, save_dir="mask_visualizations"):
+    """
+    img: (B,1,H,W) float
+    Shows original, binary mask (white=masked), and overlay.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    ids_flat, mask_bool, f = build_mask_like_forward(maskgit, img)
+
+    B, S = mask_bool.shape
+    H, W = img.shape[-2:]
+
+    # take first item for display
+    m = mask_bool[0].view(f, f).float()
+    m_up = F.interpolate(m[None, None], size=(H, W), mode="nearest")[0, 0]
+
+    x = img[0, 0].detach().cpu().numpy()
+    mnp = m_up.detach().cpu().numpy()
+
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    ax[0].imshow(x, cmap="Reds", vmin=x.min(), vmax=x.max()); ax[0].set_title("Original"); ax[0].axis("off")
+    ax[1].imshow(mnp, cmap="gray", vmin=0, vmax=1);          ax[1].set_title("Mask (white = masked)"); ax[1].axis("off")
+
+    overlay = x.copy()
+    overlay[mnp > 0.5] = overlay[mnp > 0.5] * 1.2
+    ax[2].imshow(overlay, cmap="Reds", vmin=x.min(), vmax=x.max()); ax[2].set_title("Overlay"); ax[2].axis("off")
+
+    pct = 100.0 * mask_bool[0].float().mean().item()
+    fig.suptitle(f"Step {step} — masked {mask_bool[0].sum().item()}/{S} tokens ({pct:.1f}%)")
+    path = os.path.join(save_dir, f"mask_step_{step}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"✓ saved {path}")
 
 # ============================================================
 # symmetry-safe spatial ops
@@ -253,12 +322,16 @@ class TrainingConfig:
         self.save_every = 1_000
 
         # mask schedule: anneal high → low
-        self.mask_start = 0.60
-        self.mask_end   = 0.30
+        self.mask_start = 0.90
+        self.mask_end   = 0.10
 
         # other
         self.critic_loss_weight = 0.5
         self.val_fraction_backup = 0.10
+        
+        # mask visualization
+        self.visualize_mask_every = 1000  # Visualize masking every N steps (0 to disable)
+        self.save_mask_visualizations = True  # Save mask visualizations to disk
 
         # ----------------- VQGAN configs -----------------
 
@@ -418,7 +491,7 @@ class MuseTrainer:
 
         self.maskgit_high = MaskGit(
             vae=self.vae_high, transformer=self.tr_high, image_size=512, cond_vae=self.vae_base, 
-            cond_image_size=256, cond_drop_prob=0.1, self_cond_prob=0.9, no_mask_token_prob=0.1
+            cond_image_size=256, cond_drop_prob=0.25, self_cond_prob=0.9, no_mask_token_prob=0.1
         ).to(self.device)
 
         # self._sync_transformer_seq_len(self.maskgit_low,  image_size=256, tag="LOW")
@@ -442,6 +515,25 @@ class MuseTrainer:
 
         # quick health check of VAEs on a tiny batch
         self._check_vaes()
+
+        try:
+            lo_val, hi_val, _ = next(iter(self.val_loader))   # one batch from val
+        except StopIteration:
+            lo_val, hi_val, _ = next(iter(self.train_loader)) # fallback to train
+
+        hi_val = hi_val[:1].to(self.device).float()           # keep it tiny to save mem
+        with torch.no_grad():
+            fmap, _, _ = self.vae_high.encode(hi_val)
+            hr_rec = self.vae_high.decode(fmap)
+            mse = torch.mean((hr_rec - hi_val) ** 2).item()
+            # optional: use your psnr() helper defined above
+            psnr_val = psnr(hr_rec, hi_val)
+
+        print(f"[VAE-high] real-batch recon MSE: {mse:.4f}  PSNR: {psnr_val:.2f} dB")
+        try:
+            wandb.log({"hr_vae/real_batch_mse": mse, "hr_vae/real_batch_psnr": psnr_val})
+        except Exception:
+            pass
 
     def _check_vaes(self):
         # Make absolutely sure models are on the right device
@@ -535,9 +627,21 @@ class MuseTrainer:
             hi = hi.float()
             
             # Forward pass without autocast
-            loss_lo = self.maskgit_low(lo, dna_coords=coords if self.cfg.use_dna else None, train_only_generator=False)
+            #loss_lo = self.maskgit_low(lo, dna_coords=coords if self.cfg.use_dna else None, train_only_generator=False)
             loss_hi = self.maskgit_high(hi, dna_coords=coords if self.cfg.use_dna else None, cond_images=lo, train_only_generator=False)
-            loss = (loss_lo + loss_hi) / self.cfg.gradient_accumulation_steps
+            loss = (loss_hi) / self.cfg.gradient_accumulation_steps
+            
+            # Visualize masking periodically
+            if self.cfg.visualize_mask_every > 0 and (self.global_step % self.cfg.visualize_mask_every == 0):
+                try:
+                    visualize_mask_once(self.maskgit_high, hi, self.global_step, save_dir="mask_visualizations")
+                    # quick schedule sanity print
+                    # sample schedule outputs at fixed times to see amplitude
+                    tprobe = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.999], device=hi.device)
+                    rprobe = self.maskgit_high.noise_schedule(tprobe)
+                    print(f"[mask-sched] t={tprobe.tolist()} -> ratio={rprobe.tolist()}")
+                except Exception as e:
+                    print(f"mask viz failed: {e}")
 
             # Check for NaN/Inf before backward pass
             if torch.isnan(loss) or torch.isinf(loss):

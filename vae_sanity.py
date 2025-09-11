@@ -1,36 +1,20 @@
 import torch, numpy as np
-from vqgan_vae_hic_weighted import VQGanVAE
+from muse_pipeline_downsampled import TrainingConfig, MuseTrainer
 
-ckpt = "/scratch/rnd-rojas/Manan/vq_highres_results_gpt5/vae.best_srcc.pt"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+cfg = TrainingConfig()
+trainer = MuseTrainer(cfg)
+trainer.vae.eval()
 
-vae = VQGanVAE(
-    dim=384, channels=1, layers=4,
-    codebook_size=2048,
-    lookup_free_quantization=False,          # DISCRETE VQ (must match training)
-    vq_kwargs=dict(commitment_weight=0.4, decay=0.99),
-    use_vgg_and_gan=False
-).to(device).eval()
+# grab a small batch of your HR tiles (they're in [0,1] now)
+lo, hi, _ = next(iter(trainer.val_loader))
+x01 = hi.to(trainer.device).float()[:4]          # [0,1]
+xm1 = x01 * 2 - 1                                 # [-1,1]
 
-sd = torch.load(ckpt, map_location="cpu")
-if isinstance(sd, dict) and "state_dict" in sd:
-    sd = sd["state_dict"]
-
-missing, unexpected = vae.load_state_dict(sd, strict=False)
-print("[VAE load] missing:", missing)
-print("[VAE load] unexpected:", unexpected)
-
-# --- Inspect any 2D tensors that look like a codebook
-cb_shapes = [(k, tuple(v.shape)) for k,v in vae.state_dict().items() if getattr(v, "ndim", 0) == 2]
-print("2D params:", cb_shapes)
-
-# Quick encode/decode + utilization check
-arr = np.load("/scratch/rnd-rojas/Manan/muse-maskgit-pytorch/highres_dataset_gpt5.npy", mmap_mode="r")
-x = torch.from_numpy(arr[:4]).float().to(device)                  # (4,1,512,512)
 with torch.no_grad():
-    fmap, idx, _ = vae.encode(x)                                  # idx: (4, 32, 32)
-    y = vae.decode(fmap)
+    rec01 = trainer.vae.decode(trainer.vae.encode(x01)[0])
+    recm1 = trainer.vae.decode(trainer.vae.encode(xm1)[0])
+    mse01 = torch.mean((rec01 - x01)**2).item()
+    msem1 = torch.mean((recm1 - xm1)**2).item()
 
-u = torch.unique(idx)
-print("Unique codes in batch:", u.numel(), "min/max idx:", idx.min().item(), idx.max().item())
-print("MAE recon:", torch.mean(torch.abs(x - y)).item())
+print("MSE when feeding [0,1]:", mse01)
+print("MSE when feeding [-1,1]:", msem1)

@@ -502,6 +502,9 @@ class MaskGit(nn.Module):
             self.token_critic = SelfCritic(transformer)
 
         self.critic_loss_weight = critic_loss_weight
+        self.mask_strategy = 'random'   # 'random' | 'band' | 'distance_weighted'
+        self.mask_band_halfwidth = 8  # tokens from diagonal (on 64x64 tokens, 8 ≈ 8*25kb each side)
+        self.mask_band_frac = 0.8     # fraction of masked tokens drawn from the band
 
         # self conditioning
         self.self_cond_prob = self_cond_prob
@@ -509,6 +512,10 @@ class MaskGit(nn.Module):
         # percentage of tokens to be [mask]ed to remain the same token, so that transformer produces better embeddings across all tokens as done in original BERT paper
         # may be needed for self conditioning
         self.no_mask_token_prob = no_mask_token_prob
+        self.debug_outdir = "token_maps"   # directory to save PNGs
+        self.debug_every  = 1000           # save every N forward calls; set 0 to disable
+        self.debug_max_b  = 2              # how many samples per dump
+        self._debug_step  = 0              # internal counter
 
     def save(self, path):
         torch.save(self.state_dict(), path)
@@ -518,6 +525,7 @@ class MaskGit(nn.Module):
         assert path.exists()
         state_dict = torch.load(str(path))
         self.load_state_dict(state_dict)
+
 
     @torch.no_grad()
     @eval_decorator
@@ -672,11 +680,57 @@ class MaskGit(nn.Module):
         num_token_masked = (seq_len * rand_mask_probs).round().clamp(min = 1)
 
         mask_id = self.mask_id
-        batch_randperm = torch.rand((batch, seq_len), device = device).argsort(dim = -1)
-        mask = batch_randperm < rearrange(num_token_masked, 'b -> b 1')
+        f = int(seq_len ** 0.5)
+        strategy = getattr(self, 'mask_strategy', 'random')
+
+        if strategy == 'random':
+            batch_randperm = torch.rand((batch, seq_len), device=device).argsort(dim=-1)
+            mask = batch_randperm < num_token_masked[:, None]
+
+        elif strategy == 'band':
+            d = torch.arange(f, device=device)
+            D = (d[:, None] - d[None, :]).abs()         # [f, f] distance to diagonal
+            band = (D <= getattr(self, 'mask_band_halfwidth', 8)).reshape(-1)  # [S]
+            mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
+
+            p_in = float(getattr(self, 'mask_band_frac', 0.8))
+            idx_in  = torch.nonzero(band,  as_tuple=False)[:, 0]
+            idx_out = torch.nonzero(~band, as_tuple=False)[:, 0]
+
+            for b in range(batch):
+                k      = int(num_token_masked[b].item())
+                k_in   = min(int(round(p_in * k)), idx_in.numel())
+                k_out  = max(0, k - k_in)
+                if idx_out.numel() == 0: k_out = 0
+
+                sel_in  = idx_in[torch.randperm(idx_in.numel(),  device=device)[:k_in]]
+                sel_out = idx_out[torch.randperm(idx_out.numel(), device=device)[:k_out]]
+                sel = torch.cat((sel_in, sel_out), dim=0)
+                mask[b, sel] = True
+
+        elif strategy == 'distance_weighted':
+            # Soft preference to diagonal using a Gaussian over |i-j|
+            d = torch.arange(f, device=device)
+            D = (d[:, None] - d[None, :]).abs().reshape(-1).float()  # [S]
+            sigma = float(getattr(self, 'mask_diag_sigma', f / 8))
+            w = torch.exp(-(D * D) / (2 * sigma * sigma))
+            w = w / w.sum()
+            mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
+            for b in range(batch):
+                k = int(num_token_masked[b].item())
+                sel = torch.multinomial(w, k, replacement=False)
+                mask[b, sel] = True
+
+        else:
+            raise ValueError(f'unknown mask_strategy: {strategy}')
 
         mask_id = self.transformer.mask_id
         labels = torch.where(mask, ids, ignore_index)
+
+        # --- DEBUG: masked-image visualization (same cadence as token maps) ---
+        if getattr(self, "debug_every", 0) and (self.debug_every > 0) and (self._debug_step % self.debug_every == 0):
+            f = int(seq_len ** 0.5)
+            self._debug_save_masked_image(images_or_ids, ids, mask, f, tag="train")
 
         if self.no_mask_token_prob > 0.:
             no_mask_mask = get_mask_subset_prob(mask, self.no_mask_token_prob)
@@ -721,6 +775,20 @@ class MaskGit(nn.Module):
             dna_coords = dna_coords
         )
 
+        # --- DEBUG: token maps + decoded regen ---
+        if getattr(self, "debug_every", 0) and (self.debug_every > 0) and (self._debug_step % self.debug_every == 0):
+            self._debug_save_token_maps(
+                ids_true = ids,                    # [B, S] GT tokens
+                cond_token_ids = cond_token_ids,   # [B, S] or None
+                mask_bool = mask,                  # [B, S]
+                logits = logits,                   # [B, S, K]
+                seq_len = seq_len,
+                tag = "train"
+            )
+
+        # advance the debug counter once per forward
+        self._debug_step += 1
+
         if not exists(self.token_critic) or train_only_generator:
             return ce_loss
 
@@ -741,7 +809,7 @@ class MaskGit(nn.Module):
 
         return ce_loss + self.critic_loss_weight * bce_loss
 
-# final Muse class
+    # final Muse class
 
 @torch.no_grad()
 def generate_from_dna(maskgit: MaskGit,

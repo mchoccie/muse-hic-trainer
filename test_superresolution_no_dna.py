@@ -75,7 +75,7 @@ def safe_metrics(real_hw: np.ndarray, pred_hw: np.ndarray):
 
     return psnr_v, ssim_v, pear, spear
 
-def save_sr_panel(lr, hr, hr_rec, sr, coords, batch_idx, outdir="sr_eval"):
+def save_sr_panel(lr, hr, hr_rec, sr, coords, batch_idx, outdir="sr_eval_2"):
     """
     All tensors are [B,1,H,W] (enforced before calling).
     Saves 2 figures:
